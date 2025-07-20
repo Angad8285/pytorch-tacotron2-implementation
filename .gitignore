@@ -1,0 +1,27 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Data and metadata files
+# We don't want to upload our large dataset to GitHub
+data/
+*.csv
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# macOS specific files
+.DS_Store
+
+# IDE and editor configuration
+.vscode/
+.idea/
+
+# Directory for our future trained models
+trained_models/
+
+# Installer logs
+pip-log.txt
