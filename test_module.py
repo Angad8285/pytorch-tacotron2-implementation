@@ -11,7 +11,8 @@ print(f"Number of symbols in vocabulary: {len(config.SYMBOLS)}")
 
 
 # 2. Test the text module with phoneme conversion
-sample_text = "This is a test!"
+sample_text = "abcdefghijklmnopqrstuvwxyz 1234 Dr. Jones Singh!"
+# sample_text = "1234"
 
 # Get the sequence of integer IDs from our text module
 sequence = text.text_to_sequence(sample_text)
