@@ -21,3 +21,33 @@ SYMBOLS = [
     'UH0', 'UH1', 'UH2', 'UW0', 'UW1', 'UW2', 'V', 'W', 'Y', 'Z', 'ZH',
     ' ', '.', ','
 ]
+
+# Model Parameters
+symbols_embedding_dim = 512
+
+# Encoder parameters
+encoder_n_convolutions = 3
+encoder_embedding_dim = 512
+encoder_kernel_size = 5
+
+# Decoder parameters
+n_mels = 80  # Number of mel-spectrogram channels
+decoder_rnn_dim = 1024
+prenet_dim = 256
+max_decoder_steps = 1000
+gate_threshold = 0.5
+p_attention_dropout = 0.1
+p_decoder_dropout = 0.1
+
+# Attention parameters
+attention_rnn_dim = 1024
+attention_dim = 128
+
+# Location-sensitive attention parameters
+location_n_filters = 32
+location_kernel_size = 31
+
+# Post-Net parameters
+postnet_embedding_dim = 512
+postnet_kernel_size = 5
+postnet_n_convolutions = 5
