@@ -17,7 +17,7 @@ def _normalize_text(text: str) -> str:
     text = text.lower()
 
     # Expand numbers to words
-    text = re.sub(r"(\d+)", lambda m: p.number_to_words(m.group(0)), text)
+    text = re.sub(r"(\d+)", lambda m: p.number_to_words(m.group(0)), text) # type: ignore
 
     # Replace hyphens and other punctuation with spaces
     text = re.sub(r'[.,-]', ' ', text)

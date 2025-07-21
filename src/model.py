@@ -127,7 +127,7 @@ class LocationSensitiveAttention(nn.Module):
         # The core logic is simplified here
         
         # Process the cumulative weights to get location features
-        attention_weights_cat = self.cumulative_weights.unsqueeze(1)
+        attention_weights_cat = self.cumulative_weights.unsqueeze(1) # type: ignore
         
         # Get the alignment scores (energies)
         alignment = self._get_alignment_energies(
@@ -140,7 +140,7 @@ class LocationSensitiveAttention(nn.Module):
         attention_weights = F.softmax(alignment, dim=1)
         
         # Update the cumulative weights
-        self.cumulative_weights = self.cumulative_weights + attention_weights
+        self.cumulative_weights = self.cumulative_weights + attention_weights # type: ignore
         
         context_vector = torch.bmm(attention_weights.unsqueeze(1), memory)
         context_vector = context_vector.squeeze(1)
