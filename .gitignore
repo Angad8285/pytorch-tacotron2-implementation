@@ -1,6 +1,8 @@
 # Python virtual environment
 venv/
 
+# all/any zip files
+*.zip
 # Python cache files
 __pycache__/
 *.pyc

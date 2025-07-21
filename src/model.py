@@ -409,26 +409,27 @@ class Tacotron2(nn.Module):
         self.postnet = PostNet()
         self.n_mels = config.n_mels
 
+    # In the Tacotron2 class in src/model.py
+
     def forward(self, text_inputs, mel_targets):
         """
         The main forward pass for training.
-        Args:
-            text_inputs: Padded phoneme ID sequences.
-            mel_targets: Ground-truth mel spectrograms for teacher forcing.
         """
-        # Run the encoder
         encoder_outputs = self.encoder(text_inputs)
         
-        # Run the decoder with teacher forcing
-        # The decoder returns the spectrogram BEFORE the post-net
         mel_outputs_coarse, gate_outputs, alignments = self.decoder(
-            encoder_outputs, mel_targets, mask=None # Masking will be handled by the data loader
+            encoder_outputs, mel_targets, mask=None
         )
         
-        # Run the Post-Net
-        postnet_residual = self.postnet(mel_outputs_coarse)
+        # --- THIS IS THE FIX ---
+        # The PostNet expects (batch, n_mels, time), but the decoder
+        # outputs (batch, time, n_mels). We need to transpose.
+        mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
+        postnet_residual = self.postnet(mel_outputs_coarse_transposed)
         
-        # Add the residual to the decoder's output to get the final prediction
+        # The PostNet residual also needs to be transposed back
+        postnet_residual = postnet_residual.transpose(1, 2)
+        
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
         
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
@@ -439,13 +440,13 @@ class Tacotron2(nn.Module):
         """
         encoder_outputs = self.encoder(text_inputs)
         
-        # The decoder's inference method is autoregressive
         mel_outputs_coarse, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
         
-        # Run the Post-Net
-        postnet_residual = self.postnet(mel_outputs_coarse)
+        # --- THIS IS THE FIX ---
+        mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
+        postnet_residual = self.postnet(mel_outputs_coarse_transposed)
+        postnet_residual = postnet_residual.transpose(1, 2)
         
-        # Add the residual to get the final spectrogram
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
         
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
