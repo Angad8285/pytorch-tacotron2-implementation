@@ -37,7 +37,7 @@ input.txt
 
 # In your .gitignore file, add these at the end
 
-
 # Explicitly allow our first sample and input file
-!generated_audio/output_4.wav
+
 !input.txt
+!generated_audio/output_4.wav
