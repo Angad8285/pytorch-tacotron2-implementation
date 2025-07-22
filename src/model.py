@@ -433,7 +433,7 @@ class Tacotron2(nn.Module):
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
         
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
-    
+
     def inference(self, text_inputs):
         """
         The forward pass for inference (generating new audio).
@@ -442,11 +442,15 @@ class Tacotron2(nn.Module):
         
         mel_outputs_coarse, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
         
-        # --- THIS IS THE FIX ---
         mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
         postnet_residual = self.postnet(mel_outputs_coarse_transposed)
         postnet_residual = postnet_residual.transpose(1, 2)
         
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
+        
+        # --- THIS IS THE FIX ---
+        # Transpose the outputs to the standard (batch, n_mels, time) format
+        mel_outputs_postnet = mel_outputs_postnet.transpose(1, 2)
+        mel_outputs_coarse = mel_outputs_coarse.transpose(1, 2)
         
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)

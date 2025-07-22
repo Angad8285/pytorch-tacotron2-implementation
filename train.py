@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 import argparse
 import time
 import os
+import matplotlib.pyplot as plt
 
 from src import config
 from src.model import Tacotron2
@@ -45,6 +46,25 @@ class Tacotron2Loss(nn.Module):
         total_loss = loss_mel + loss_gate
         return total_loss
 
+def save_alignment_plot(alignment, path):
+    """Saves a plot of the attention alignment to a file."""
+    # The alignment is a list of tensors from the last batch, 
+    # take the first item for visualization.
+    # Shape of alignment: (num_decoder_steps, num_encoder_steps)
+    alignment = alignment[0].detach().cpu().numpy().T
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.imshow(alignment, aspect='auto', origin='lower',
+                   interpolation='none', cmap='viridis')
+    fig.colorbar(im, ax=ax)
+    plt.xlabel("Encoder timestep (Phonemes)")
+    plt.ylabel("Decoder timestep")
+    plt.title("Attention Alignment")
+    plt.tight_layout()
+    
+    plt.savefig(path)
+    plt.close()
+
 def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
     """The main training routine."""
     torch.manual_seed(1234)
@@ -77,7 +97,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
     # --- UNIVERSAL MIXED-PRECISION ---
     # GradScaler is enabled if we are on a GPU (cuda or mps)
     use_amp = (device.type != 'cpu')
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp) # type: ignore
     
     model.train()
 
@@ -132,6 +152,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
             'loss': avg_epoch_loss,
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
+
 
     print("\nTraining complete.")
 

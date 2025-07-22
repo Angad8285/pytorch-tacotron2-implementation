@@ -1,14 +1,11 @@
 # Python virtual environment
 venv/
 
-# all/any zip files
-*.zip
 # Python cache files
 __pycache__/
 *.pyc
 
 # Data and metadata files
-# We don't want to upload our large dataset to GitHub
 data/
 *.csv
 
@@ -22,8 +19,25 @@ data/
 .vscode/
 .idea/
 
-# Directory for our future trained models
+# Trained models from our script and downloaded pre-trained models
 trained_models/
+*.pth
+*.pt
 
-# Installer logs
-pip-log.txt
+# Generated audio files
+generated_audio/
+*.wav
+
+# Redundant archives
+*.zip
+
+# Temporary test scripts and input files
+test_*.py
+input.txt
+
+# In your .gitignore file, add these at the end
+
+
+# Explicitly allow our first sample and input file
+!generated_audio/output_4.wav
+!input.txt
