@@ -1,4 +1,4 @@
-# train.py
+# train.py works on google colab
 
 import torch
 import torch.nn as nn
