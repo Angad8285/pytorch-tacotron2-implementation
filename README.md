@@ -2,7 +2,7 @@
 
 This project is a complete Text-to-Speech (TTS) pipeline built from scratch in PyTorch. It implements the **Tacotron 2** model for generating mel spectrograms from text, paired with a pre-trained **HiFi-GAN** vocoder to synthesize the final audio waveform.
 
-## ✨ Features
+## Features
 
   * **End-to-End Pipeline**: From raw text and audio to a synthesized waveform.
   * **Tacotron 2 Architecture**: A faithful implementation of the spectrogram prediction network described in the [original paper](https://arxiv.org/abs/1712.05884).
@@ -12,7 +12,7 @@ This project is a complete Text-to-Speech (TTS) pipeline built from scratch in P
 
 -----
 
-## 🛠️ Tech Stack
+## Tech Stack
 
   * Python 3
   * PyTorch
@@ -22,7 +22,7 @@ This project is a complete Text-to-Speech (TTS) pipeline built from scratch in P
 
 -----
 
-## 📂 Project Structure
+## Project Structure
 
 ```
 multi-speaker-tts/
@@ -45,7 +45,7 @@ multi-speaker-tts/
 
 -----
 
-## ⚙️ Setup and Installation
+## Setup and Installation
 
 1.  **Clone the repository:**
 

@@ -100,6 +100,8 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
     scaler = torch.amp.GradScaler(enabled=use_amp) # type: ignore
     
     model.train()
+    
+    
 
     for epoch in range(epochs):
         start_time = time.time()
@@ -152,7 +154,13 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
             'loss': avg_epoch_loss,
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
-
+        
+        # Save the attention alignment from the last batch of the epoch
+        if model_outputs is not None: # type: ignore
+            _, _, _, alignments = model_outputs #type: ignore
+            alignment_path = os.path.join(checkpoint_dir, f"alignment_epoch_{epoch+1}.png")
+            save_alignment_plot(alignments, alignment_path)
+            print(f"Alignment plot saved to {alignment_path}")
 
     print("\nTraining complete.")
 
