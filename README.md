@@ -51,7 +51,7 @@ multi-speaker-tts/
 
     ```bash
     git clone https://github.com/Angad8285/pytorch-tacotron2-implementation.git
-    cd your-repo-name
+    cd pytorch-tacotron2-implementation
     ```
 
 2.  **Create and activate a Python virtual environment:**
