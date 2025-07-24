@@ -50,7 +50,7 @@ multi-speaker-tts/
 1.  **Clone the repository:**
 
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
+    git clone https://github.com/Angad8285/pytorch-tacotron2-implementation.git
     cd your-repo-name
     ```
 
