@@ -1,4 +1,4 @@
-# train.py that works on both CUDA and MPS devices
+# train.py
 
 import torch
 import torch.nn as nn
@@ -7,6 +7,11 @@ import argparse
 import time
 import os
 import matplotlib.pyplot as plt
+from datetime import datetime  # <-- Added this import
+
+# Add the local NLTK data path
+import nltk
+nltk.data.path.append('./nltk_data')
 
 from src import config
 from src.model import Tacotron2
@@ -47,12 +52,7 @@ class Tacotron2Loss(nn.Module):
         return total_loss
 
 def save_alignment_plot(alignment, path):
-    """Saves a plot of the attention alignment to a file."""
-    # The alignment is a list of tensors from the last batch, 
-    # take the first item for visualization.
-    # Shape of alignment: (num_decoder_steps, num_encoder_steps)
     alignment = alignment[0].detach().cpu().numpy().T
-
     fig, ax = plt.subplots(figsize=(10, 6))
     im = ax.imshow(alignment, aspect='auto', origin='lower',
                    interpolation='none', cmap='viridis')
@@ -61,17 +61,20 @@ def save_alignment_plot(alignment, path):
     plt.ylabel("Decoder timestep")
     plt.title("Attention Alignment")
     plt.tight_layout()
-    
     plt.savefig(path)
     plt.close()
 
+######################### DEBUG
 def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
-    """The main training routine."""
+    """
+    A modified training routine for a detailed single-batch overfitting test.
+    --- THIS VERSION HAS MIXED-PRECISION DISABLED FOR DEBUGGING ---
+    """
+    # --- TWEAK 1: Increased iterations ---
+    iterations = 1200
+    
     torch.manual_seed(1234)
     
-    # --- UNIVERSAL DEVICE SELECTION ---
-    # This block checks for an NVIDIA GPU first, then an Apple Silicon GPU,
-    # and falls back to the CPU if neither is available.
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -88,81 +91,140 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
         dataset, batch_size=batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=0
     )
-    print(f"Loaded {len(dataset)} training samples.")
-
+    
     model = Tacotron2().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = Tacotron2Loss()
     
-    # --- UNIVERSAL MIXED-PRECISION ---
-    # GradScaler is enabled if we are on a GPU (cuda or mps)
-    use_amp = (device.type != 'cpu')
-    scaler = torch.amp.GradScaler(enabled=use_amp) # type: ignore
+    print("\n--- DEBUG MODE: Starting single-batch overfitting test (Mixed-Precision DISABLED). ---")
     
+    print("Fetching a single batch to overfit...")
+    single_batch = next(iter(data_loader))
+    
+    text_padded, _, mel_padded, mel_lengths = single_batch
+    text_padded = text_padded.to(device)
+    mel_padded = mel_padded.to(device)
+    mel_lengths = mel_lengths.to(device)
+    gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
+    for j, length in enumerate(mel_lengths):
+        gate_target[j, length.item()-1:] = 1
+
     model.train()
     
+    print(f"--- Training on one batch for {iterations} iterations... ---")
     
+    for i in range(iterations):
+        optimizer.zero_grad(set_to_none=True)
+        
+        # Running without autocast and scaler for stability
+        model_outputs = model(text_padded, mel_padded)
+        loss = criterion(model_outputs, (mel_padded, gate_target, mel_lengths))
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
-    for epoch in range(epochs):
-        start_time = time.time()
-        epoch_loss = 0.0
-        print(f"\nEpoch: {epoch + 1}/{epochs}")
-        
-        for i, batch in enumerate(data_loader):
-            text_padded, _, mel_padded, mel_lengths = batch
-            
-            text_padded = text_padded.to(device)
-            mel_padded = mel_padded.to(device)
-            mel_lengths = mel_lengths.to(device)
-            
-            gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
-            for j, length in enumerate(mel_lengths):
-                gate_target[j, length.item()-1:] = 1
+        if (i + 1) % 10 == 0:
+            print(f"  Iteration {i+1}/{iterations}, Loss: {loss.item():.6f}")
 
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Autocast is also enabled only on GPU
-            with torch.autocast(device_type=device.type, enabled=use_amp):
-                model_outputs = model(text_padded, mel_padded)
-                loss = criterion(model_outputs, (mel_padded, gate_target, mel_lengths))
-            
-            # Backpropagation using the scaler
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            epoch_loss += loss.item()
-            
-            # this print statement sometimes does not work
-            # if (i + 1) % 10 == 0:
-            #     print(f"  Batch {i+1}/{len(data_loader)}, Loss: {loss.item():.6f}", end='\r')
-            
-            # use this instead
-            print(f"  Batch {i+1}/{len(data_loader)}, Loss: {loss.item():.6f}")
-        
-        avg_epoch_loss = epoch_loss / len(data_loader)
-        epoch_time = time.time() - start_time
-        print(f"\nEpoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.6f}, Time: {epoch_time:.2f}s")
-        
-        checkpoint_path = os.path.join(checkpoint_dir, f"tacotron2_epoch_{epoch+1}.pth")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': avg_epoch_loss,
-        }, checkpoint_path)
-        print(f"Checkpoint saved to {checkpoint_path}")
-        
-        # Save the attention alignment from the last batch of the epoch
-        if model_outputs is not None: # type: ignore
-            _, _, _, alignments = model_outputs #type: ignore
-            alignment_path = os.path.join(checkpoint_dir, f"alignment_epoch_{epoch+1}.png")
-            save_alignment_plot(alignments, alignment_path)
-            print(f"Alignment plot saved to {alignment_path}")
+        # --- TWEAK 2: Save plot every 300 iterations ---
+        if (i + 1) % 300 == 0:
+            print(f"\n--- Saving alignment plot at iteration {i+1}... ---")
+            if model_outputs is not None:
+                _, _, _, alignments = model_outputs
+                alignment_path = os.path.join(checkpoint_dir, f"overfit_alignment_iter_{i+1}.png")
+                save_alignment_plot(alignments, alignment_path)
+                print(f"Alignment plot saved to {alignment_path}\n")
 
-    print("\nTraining complete.")
+    print("\n--- Overfitting test complete. ---")
+
+# ######################## ACTUAL
+# def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
+#     torch.manual_seed(1234)
+    
+#     if torch.cuda.is_available():
+#         device = torch.device("cuda")
+#     elif torch.backends.mps.is_available():
+#         device = torch.device("mps")
+#     else:
+#         device = torch.device("cpu")
+#     print(f"Using device: {device}")
+    
+#     os.makedirs(checkpoint_dir, exist_ok=True)
+
+#     dataset = TextMelDataset(metadata_path)
+#     collate_fn = TextMelCollate()
+#     data_loader = DataLoader(
+#         dataset, batch_size=batch_size, shuffle=True,
+#         collate_fn=collate_fn, num_workers=0
+#     )
+#     print(f"Loaded {len(dataset)} training samples.")
+
+#     model = Tacotron2().to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#     criterion = Tacotron2Loss()
+    
+#     scaler = torch.amp.GradScaler(enabled=(device.type != 'cpu'))
+    
+#     model.train()
+#     model_outputs = None
+
+#     for epoch in range(epochs):
+#         start_time = time.time()
+#         epoch_loss = 0.0
+        
+#         # --- TWEAK 1: Added timestamp to the epoch printout ---
+#         print(f"\n--- Starting Epoch {epoch + 1}/{epochs} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+        
+#         for i, batch in enumerate(data_loader):
+#             text_padded, _, mel_padded, mel_lengths = batch
+            
+#             text_padded = text_padded.to(device)
+#             mel_padded = mel_padded.to(device)
+#             mel_lengths = mel_lengths.to(device)
+            
+#             gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
+#             for j, length in enumerate(mel_lengths):
+#                 gate_target[j, length.item()-1:] = 1
+
+#             optimizer.zero_grad(set_to_none=True)
+            
+#             with torch.autocast(device_type=device.type, enabled=(device.type != 'cpu')):
+#                 model_outputs = model(text_padded, mel_padded)
+#                 loss = criterion(model_outputs, (mel_padded, gate_target, mel_lengths))
+            
+#             scaler.scale(loss).backward()
+#             scaler.unscale_(optimizer)
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#             scaler.step(optimizer)
+#             scaler.update()
+            
+#             epoch_loss += loss.item()
+            
+#             # --- TWEAK 2: This block already prints every 10th batch ---
+#             if (i + 1) % 10 == 0:
+#                 print(f"  Batch {i+1}/{len(data_loader)}, Loss: {loss.item():.6f}")
+        
+#         avg_epoch_loss = epoch_loss / len(data_loader)
+#         epoch_time = time.time() - start_time
+#         print(f"\nEpoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.6f}, Time: {epoch_time:.2f}s")
+        
+#         checkpoint_path = os.path.join(checkpoint_dir, f"tacotron2_epoch_{epoch+1}.pth")
+#         torch.save({
+#             'epoch': epoch,
+#             'model_state_dict': model.state_dict(),
+#             'optimizer_state_dict': optimizer.state_dict(),
+#             'loss': avg_epoch_loss,
+#         }, checkpoint_path)
+#         print(f"Checkpoint saved to {checkpoint_path}")
+
+#         if model_outputs is not None:
+#             _, _, _, alignments = model_outputs
+#             alignment_path = os.path.join(checkpoint_dir, f"alignment_epoch_{epoch+1}.png")
+#             save_alignment_plot(alignments, alignment_path)
+#             print(f"Alignment plot saved to {alignment_path}")
+
+#     print("\nTraining complete.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

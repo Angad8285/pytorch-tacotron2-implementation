@@ -300,6 +300,15 @@ class Decoder(nn.Module):
         """
         self._initialize_decoder_states(memory, mask=None)
 
+            # --- ADD THIS BLOCK FOR DEBUGGING ---
+        print("\n--- DEBUGGING FIRST DECODER STEP ---")
+        mel_output_debug, gate_output_debug, attention_weights_debug = self._decode_step(memory, mask=None)
+        print(f"Initial Stop Token value: {torch.sigmoid(gate_output_debug.data).item():.4f}")
+        print("This value should be LOW (e.g., < 0.5). If it's high, the model stops immediately.")
+        print("--- END DEBUGGING ---\n")
+        # --- You can add an `exit()` here to stop the script after debugging ---
+        # exit()
+
         mel_outputs, gate_outputs, alignments = [], [], []
 
         # Loop until the model predicts to stop or we hit the max steps

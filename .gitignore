@@ -1,43 +1,52 @@
 # Python virtual environment
-venv/
+/venv/
 
 # Python cache files
 __pycache__/
 *.pyc
 
-# Data and metadata files
-data/
-*.csv
-
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# macOS specific files
-.DS_Store
-
 # IDE and editor configuration
 .vscode/
 .idea/
 
-# Trained models from our script and downloaded pre-trained models
+# macOS specific files
+.DS_Store
+
+# --- Datasets and Processed Data ---
+# Ignore raw datasets
+data/LibriSpeech/
+data/LJSpeech-1.1/
+
+# Ignore all generated metadata files
+data/*_metadata.csv
+metadata.csv
+
+# Ignore all pre-processed and cached data folders
+data/ljspeech_processed/
+data/ljspeech_processed2/
+data/training_data/
+
+# Ignore downloaded NLTK data packages
+nltk_data/
+
+# --- Models & Outputs ---
+# Ignore trained models and downloaded checkpoints
 trained_models/
 *.pth
 *.pt
 
-# Generated audio files
+# Ignore generated audio files
 generated_audio/
 *.wav
 
-# Redundant archives
-*.zip
-
-# Temporary test scripts and input files
+# --- Temporary & Redundant Files ---
+# Ignore temporary test scripts, archives, and inputs
 test_*.py
+*.zip
 input.txt
 
-# In your .gitignore file, add these at the end
-
-# Explicitly allow our first sample and input file
-
-!input.txt
-!generated_audio/output_4.wav
+# --- EXCEPTIONS ---
+# Use '!' to explicitly keep a specific file if needed for your README
+# Example:
+# !generated_audio/output_4.wav
+# !input.txt

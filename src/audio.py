@@ -2,6 +2,7 @@
 
 import librosa
 import numpy as np
+import torch 
 from . import config  # Use a relative import to get settings from config.py
 
 def get_mel_spectrogram(filepath: str) -> np.ndarray:
@@ -26,4 +27,4 @@ def get_mel_spectrogram(filepath: str) -> np.ndarray:
     # Convert the power spectrogram to decibels
     mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
     
-    return mel_spec_db
+    return torch.FloatTensor(mel_spec_db)
