@@ -28,12 +28,14 @@ class Tacotron2Loss(nn.Module):
         mel_out_postnet, mel_out, gate_out, _ = model_outputs
         mel_target, gate_target, mel_lengths = targets
 
-        mel_out = mel_out.transpose(1, 2)
-        mel_out_postnet = mel_out_postnet.transpose(1, 2)
+        # FIX: No transpose needed now - outputs are already (batch, time, n_mels)
+        # mel_out and mel_out_postnet are now (batch, time, n_mels)
+        # mel_target should be (batch, n_mels, time) - transpose it to match
+        mel_target = mel_target.transpose(1, 2)  # (batch, n_mels, time) -> (batch, time, n_mels)
         
         mask = self.get_mask_from_lengths(mel_lengths)
-        mask = mask.expand(config.n_mels, mask.size(0), mask.size(1))
-        mask = mask.permute(1, 0, 2).to(mel_target.device)
+        # Expand mask to cover mel dimensions: (batch, time) -> (batch, time, n_mels)
+        mask = mask.unsqueeze(-1).expand(-1, -1, config.n_mels)
         
         mel_out.data.masked_fill_(mask, 0.0)
         mel_out_postnet.data.masked_fill_(mask, 0.0)
@@ -115,6 +117,8 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
             mel_padded = mel_padded.to(device)
             mel_lengths = mel_lengths.to(device)
             
+            # FIX: Gate target should match mel sequence length (time dimension)
+            # mel_padded is (batch, n_mels, time), we want gate for time dimension
             gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
             for j, length in enumerate(mel_lengths):
                 gate_target[j, length.item()-1:] = 1

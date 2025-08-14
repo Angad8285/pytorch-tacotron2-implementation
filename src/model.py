@@ -107,17 +107,19 @@ class LocationSensitiveAttention(nn.Module):
 
     def _get_alignment_energies(self, query, processed_memory, attention_weights_cat):
         """Computes the alignment energies."""
-        processed_query = self.query_layer(query)
+        # FIX: query should be (batch, 1, attention_rnn_dim) 
+        processed_query = self.query_layer(query)  # (batch, 1, attention_dim)
         
         # Process the location features from cumulative weights
         processed_location = self.location_convolution(attention_weights_cat)
-        processed_location = processed_location.transpose(1, 2)
-        processed_location = self.location_layer(processed_location)
+        processed_location = processed_location.transpose(1, 2)  # (batch, time, location_n_filters)
+        processed_location = self.location_layer(processed_location)  # (batch, time, attention_dim)
         
+        # All should be (batch, time, attention_dim) for broadcasting
         energies = self.v(torch.tanh(
             processed_query + processed_location + processed_memory
-        ))
-        return energies.squeeze(-1)
+        ))  # (batch, time, 1)
+        return energies.squeeze(-1)  # (batch, time)
 
     def forward(self, query, memory, mask):
         """
@@ -236,9 +238,11 @@ class Decoder(nn.Module):
 
     def _parse_decoder_outputs(self, mel_outputs, gate_outputs, alignments):
         """Prepares the decoder outputs for returning."""
-        # Transpose to (batch, n_mels, time)
-        mel_outputs = torch.stack(mel_outputs).transpose(0, 1).contiguous()
-        gate_outputs = torch.stack(gate_outputs).transpose(0, 1).contiguous()
+        # FIX: Proper stacking and transposing
+        # mel_outputs: list of (batch, n_mels) -> (batch, time, n_mels)
+        mel_outputs = torch.stack(mel_outputs, dim=1)
+        # gate_outputs: list of (batch, 1) -> (batch, time)
+        gate_outputs = torch.stack(gate_outputs, dim=1).squeeze(-1)
         
         return mel_outputs, gate_outputs, alignments
 
@@ -248,6 +252,7 @@ class Decoder(nn.Module):
         prenet_output = self.prenet(self.decoder_input)
         
         # 2. Get the context vector from the attention mechanism
+        # FIX: Use attention_hidden as query (correct in original Tacotron2)
         context_vector, self.attention_weights = self.attention.forward(
             self.attention_hidden, memory, mask
         )
@@ -288,8 +293,9 @@ class Decoder(nn.Module):
             self.decoder_input = decoder_inputs[:, i, :]
             mel_output, gate_output, attention_weights = self._decode_step(memory, mask)
             
-            mel_outputs.append(mel_output.squeeze(1))
-            gate_outputs.append(gate_output.squeeze(1))
+            # FIX: Don't squeeze - keep proper dimensions
+            mel_outputs.append(mel_output)  # (batch, n_mels)
+            gate_outputs.append(gate_output)  # (batch, 1)
             alignments.append(attention_weights)
             
         return self._parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
@@ -306,8 +312,9 @@ class Decoder(nn.Module):
         while True:
             mel_output, gate_output, attention_weights = self._decode_step(memory, mask=None)
             
-            mel_outputs.append(mel_output.squeeze(1))
-            gate_outputs.append(gate_output.squeeze(1))
+            # FIX: Don't squeeze - keep proper dimensions
+            mel_outputs.append(mel_output)  # (batch, n_mels)
+            gate_outputs.append(gate_output)  # (batch, 1)
             alignments.append(attention_weights)
             
             # Check for stop condition
@@ -421,13 +428,11 @@ class Tacotron2(nn.Module):
             encoder_outputs, mel_targets, mask=None
         )
         
-        # --- THIS IS THE FIX ---
-        # The PostNet expects (batch, n_mels, time), but the decoder
-        # outputs (batch, time, n_mels). We need to transpose.
+        # FIX: PostNet expects (batch, n_mels, time), decoder now outputs (batch, time, n_mels)
         mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
         postnet_residual = self.postnet(mel_outputs_coarse_transposed)
         
-        # The PostNet residual also needs to be transposed back
+        # Convert back to (batch, time, n_mels) to match decoder output format
         postnet_residual = postnet_residual.transpose(1, 2)
         
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
@@ -442,15 +447,12 @@ class Tacotron2(nn.Module):
         
         mel_outputs_coarse, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
         
+        # FIX: Same PostNet handling as training
         mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
         postnet_residual = self.postnet(mel_outputs_coarse_transposed)
         postnet_residual = postnet_residual.transpose(1, 2)
         
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
         
-        # --- THIS IS THE FIX ---
-        # Transpose the outputs to the standard (batch, n_mels, time) format
-        mel_outputs_postnet = mel_outputs_postnet.transpose(1, 2)
-        mel_outputs_coarse = mel_outputs_coarse.transpose(1, 2)
-        
+        # Return in (batch, time, n_mels) format for consistency
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
