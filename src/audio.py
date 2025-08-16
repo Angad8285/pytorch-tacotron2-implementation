@@ -23,7 +23,12 @@ def get_mel_spectrogram(filepath: str) -> np.ndarray:
         fmax=config.FMAX
     )
     
-    # Convert the power spectrogram to decibels
+    # Convert the power spectrogram to decibels with proper dynamic range
     mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
     
-    return mel_spec_db
+    # Normalize to [0, 1] range for stable training
+    # Typical mel spectrograms range from -80dB to 0dB
+    mel_spec_normalized = (mel_spec_db + 80.0) / 80.0  # Map [-80, 0] to [0, 1]
+    mel_spec_normalized = np.clip(mel_spec_normalized, 0.0, 1.0)  # Ensure bounds
+    
+    return mel_spec_normalized

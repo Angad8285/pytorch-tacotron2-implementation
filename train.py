@@ -15,7 +15,7 @@ from src.data_utils import TextMelDataset, TextMelCollate
 class Tacotron2Loss(nn.Module):
     def __init__(self):
         super(Tacotron2Loss, self).__init__()
-        self.mse_loss = nn.MSELoss()
+        self.mse_loss = nn.MSELoss(reduction='none')  # Use 'none' for manual masking
         self.bce_loss = nn.BCEWithLogitsLoss()
 
     def get_mask_from_lengths(self, lengths):
@@ -37,16 +37,24 @@ class Tacotron2Loss(nn.Module):
         # Expand mask to cover mel dimensions: (batch, time) -> (batch, time, n_mels)
         mask = mask.unsqueeze(-1).expand(-1, -1, config.n_mels)
         
-        mel_out.data.masked_fill_(mask, 0.0)
-        mel_out_postnet.data.masked_fill_(mask, 0.0)
-        mel_target.data.masked_fill_(mask, 0.0)
-
-        loss_mel = self.mse_loss(mel_out, mel_target) + \
-                   self.mse_loss(mel_out_postnet, mel_target)
+        # Calculate mel losses with proper masking and normalization
+        mel_loss_1 = self.mse_loss(mel_out, mel_target)
+        mel_loss_2 = self.mse_loss(mel_out_postnet, mel_target)
+        
+        # Apply mask and normalize by valid frames
+        mel_loss_1.masked_fill_(mask, 0.0)
+        mel_loss_2.masked_fill_(mask, 0.0)
+        
+        # Normalize by number of valid frames and mels
+        valid_frames = (~mask).float().sum()
+        mel_loss_1 = mel_loss_1.sum() / valid_frames
+        mel_loss_2 = mel_loss_2.sum() / valid_frames
+        
+        loss_mel = mel_loss_1 + mel_loss_2
         loss_gate = self.bce_loss(gate_out, gate_target)
         
         total_loss = loss_mel + loss_gate
-        return total_loss
+        return total_loss, loss_mel, loss_gate
 
 def save_alignment_plot(alignment, path):
     """Saves a plot of the attention alignment to a file."""
@@ -67,7 +75,7 @@ def save_alignment_plot(alignment, path):
     plt.savefig(path)
     plt.close()
 
-def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
+def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debug_overfit=False):
     """The main training routine."""
     torch.manual_seed(1234)
     
@@ -97,13 +105,93 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate):
     criterion = Tacotron2Loss()
     
     # --- UNIVERSAL MIXED-PRECISION ---
-    # GradScaler is enabled if we are on a GPU (cuda or mps)
-    use_amp = (device.type != 'cpu')
+    # GradScaler is enabled only for CUDA, not MPS due to compatibility issues
+    use_amp = (device.type == 'cuda')  # Only use AMP on NVIDIA GPUs
     scaler = torch.amp.GradScaler(enabled=use_amp) # type: ignore
     
     model.train()
     
-    
+    # === DEBUGGING MODE: OVERFIT ON SINGLE BATCH ===
+    if debug_overfit:
+        print("🔥 DEBUG MODE: Training on single batch to test overfitting capability")
+        # Force batch size 8 for debug mode
+        debug_loader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=TextMelCollate(), drop_last=True)
+        debug_batch = next(iter(debug_loader))
+        text_padded, _, mel_padded, mel_lengths = debug_batch
+        text_padded = text_padded.to(device)
+        mel_padded = mel_padded.to(device)
+        mel_lengths = mel_lengths.to(device)
+        # Create gate targets for this batch
+        gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
+        for j, length in enumerate(mel_lengths):
+            gate_target[j, length.item()-1:] = 1
+        print(f"Debug batch shapes:")
+        print(f"  Text: {text_padded.shape}")
+        print(f"  Mel: {mel_padded.shape}")
+        print(f"  Mel range: [{mel_padded.min():.3f}, {mel_padded.max():.3f}]")
+        print(f"  Lengths: {mel_lengths}")
+        print("🧪 Testing model forward pass...")
+        try:
+            with torch.no_grad():
+                print("  - Creating model outputs...")
+                model_outputs = model(text_padded, mel_padded)
+                print("  - ✅ Forward pass successful!")
+                print(f"  - Output shapes: {[x.shape if hasattr(x, 'shape') else len(x) for x in model_outputs]}")
+        except Exception as e:
+            print(f"  - ❌ Forward pass failed: {e}")
+            return
+        print("🏋️ Starting training iterations...")
+        for iteration in range(epochs * 20):  # Fewer iterations for safety
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                model_outputs = model(text_padded, mel_padded)
+                total_loss, mel_loss, gate_loss = criterion(model_outputs, (mel_padded, gate_target, mel_lengths))
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            if (iteration + 1) % 5 == 0:
+                print(f"Iteration {iteration+1:4d}, Loss: {total_loss.item():.6f}")
+                print(f"  📊 Mel Loss: {mel_loss.item():.4f}, Gate Loss: {gate_loss.item():.4f}")
+                
+                # Add attention diagnostics
+                _, _, _, alignments = model_outputs
+                if len(alignments) > 0:
+                    # Get attention from last decoder step
+                    last_attention = alignments[-1][0]  # (encoder_steps,)
+                    print(f"  🎯 Attention - max: {last_attention.max().item():.4f}, "
+                          f"min: {last_attention.min().item():.4f}, "
+                          f"std: {last_attention.std().item():.4f}")
+                    print(f"  📍 Attention peak at encoder position: {last_attention.argmax().item()}")
+                    
+                    # Check attention movement across decoder steps
+                    if len(alignments) > 10:
+                        first_peak = alignments[0][0].argmax().item()
+                        mid_peak = alignments[len(alignments)//2][0].argmax().item() 
+                        last_peak = alignments[-1][0].argmax().item()
+                        print(f"  🔄 Attention movement: {first_peak} → {mid_peak} → {last_peak} (should increase)")
+                        
+                        # Check if attention is stuck
+                        if first_peak == last_peak:
+                            print(f"  ⚠️  WARNING: Attention is stuck at position {first_peak}!")
+                    
+                    # Check attention sharpness
+                    entropy = -(last_attention * torch.log(last_attention + 1e-8)).sum().item()
+                    print(f"  📈 Attention entropy: {entropy:.3f} (lower=sharper, target<2.0)")
+            if (iteration + 1) % 10 == 0:
+                _, _, _, alignments = model_outputs
+                alignment_path = os.path.join(checkpoint_dir, f"debug_alignment_iter_{iteration+1}.png")
+                save_alignment_plot(alignments, alignment_path)
+                print(f"🎯 Alignment saved: {alignment_path}")
+            if total_loss.item() < 0.1:
+                print(f"🎉 SUCCESS! Loss dropped to {total_loss.item():.6f} - Model can learn!")
+                print(f"🎯 Final alignment saved to: debug_alignment_iter_{iteration+1}.png")
+                break
+        print("🔥 DEBUG MODE COMPLETE")
+        return
+
+    # === NORMAL TRAINING MODE ===
 
     for epoch in range(epochs):
         start_time = time.time()
@@ -175,6 +263,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs.')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
+    parser.add_argument('--debug', action='store_true', help='Debug mode: overfit on single batch.')
     
     args = parser.parse_args()
     
@@ -183,5 +272,6 @@ if __name__ == '__main__':
         checkpoint_dir=args.checkpoint_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        learning_rate=args.lr
+        learning_rate=args.lr,
+        debug_overfit=args.debug
     )

@@ -139,10 +139,41 @@ class LocationSensitiveAttention(nn.Module):
         if mask is not None:
             alignment.data.masked_fill_(mask, -float("inf"))
 
-        attention_weights = F.softmax(alignment, dim=1)
+        # Apply temperature to make attention sharper
+        temperature = 0.5 if self.training else 1.0  # Sharper during training
+        attention_weights = F.softmax(alignment / temperature, dim=1)
         
-        # Update the cumulative weights
+        # ANTI-STICKING MECHANISM: Encourage forward movement
+        if self.training and hasattr(self, 'step_count'):
+            self.step_count += 1
+            # More aggressive progression - force attention to move forward
+            expected_pos = min(self.step_count * 1.2, alignment.size(1) - 1)  # Faster progression
+            
+            # Safety check to prevent runaway computation
+            if self.step_count > alignment.size(1) * 2:
+                # Force attention to move forward if it gets stuck
+                expected_pos = min(alignment.size(1) - 1, self.step_count * 0.8)
+            
+            # Stronger discouragement for staying behind
+            discouragement = torch.exp(-0.5 * torch.abs(torch.arange(alignment.size(1), device=alignment.device) - expected_pos))
+            discouragement = discouragement.unsqueeze(0).expand_as(alignment)
+            alignment = alignment + 2.0 * discouragement.log()  # Much stronger push
+            attention_weights = F.softmax(alignment / temperature, dim=1)
+            
+            # Additional: penalize cumulative weights to prevent sticking
+            if hasattr(self, 'cumulative_weights') and self.cumulative_weights is not None:
+                cum_penalty = -0.1 * self.cumulative_weights  # Discourage high cumulative attention
+                alignment = alignment + cum_penalty
+            attention_weights = F.softmax(alignment / temperature, dim=1)
+        
+        # Update the cumulative weights with regularization to prevent sticking
         self.cumulative_weights = self.cumulative_weights + attention_weights # type: ignore
+        
+        # Add small noise to prevent attention collapse (reduced amount)
+        if self.training:
+            noise = torch.randn_like(attention_weights) * 0.005  # Reduced noise
+            attention_weights = attention_weights + noise
+            attention_weights = F.softmax(attention_weights / temperature, dim=1)  # Re-normalize with temperature
         
         context_vector = torch.bmm(attention_weights.unsqueeze(1), memory)
         context_vector = context_vector.squeeze(1)
@@ -154,7 +185,15 @@ class LocationSensitiveAttention(nn.Module):
         batch_size = memory.size(0)
         max_time = memory.size(1)
         
-        self.cumulative_weights = torch.zeros(batch_size, max_time, device=memory.device)
+        # Ensure we're on the same device as memory
+        device = memory.device
+        
+        # Always reset for new sequence
+        self.step_count = 0
+        self.cumulative_weights = torch.zeros(batch_size, max_time, device=device)
+        # Initialize with small attention bias towards the beginning
+        self.cumulative_weights[:, 0] = 0.1
+        
         self.processed_memory = self.memory_layer(memory)
 
 
