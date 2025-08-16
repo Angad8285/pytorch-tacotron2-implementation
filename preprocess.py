@@ -33,17 +33,26 @@ def preprocess_data(metadata_path, output_dir):
         basename = os.path.basename(row['filepath']).replace('.flac', '').replace('.wav', '')
         
         try:
-            # Process and save the mel spectrogram
             mel_spectrogram = audio.get_mel_spectrogram(row['filepath'])
+            # Ensure tensor type (in case backend returns numpy array)
+            if not isinstance(mel_spectrogram, torch.Tensor):
+                try:
+                    mel_spectrogram = torch.from_numpy(mel_spectrogram)
+                except Exception as conv_err:
+                    print(f"Skipping (mel convert) {row['filepath']}: {conv_err}")
+                    continue
             mel_path = os.path.join(mels_dir, f"{basename}.pt")
             torch.save(mel_spectrogram, mel_path)
-            
-            # Process and save the text sequence
+        except Exception as e:
+            print(f"Skipping (mel) {row['filepath']} due to error: {e}")
+            continue
+        try:
             text_sequence = text.text_to_sequence(row['text'])
             text_path = os.path.join(text_dir, f"{basename}.pt")
             torch.save(torch.LongTensor(text_sequence), text_path)
         except Exception as e:
-            print(f"Skipping file {row['filepath']} due to error: {e}")
+            print(f"Skipping (text) {row['filepath']} due to error: {e}")
+            continue
 
     # Copy the metadata file to the new directory for convenience
     processed_metadata_path = os.path.join(output_dir, "metadata.csv")

@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import argparse
 import time
@@ -15,8 +16,15 @@ from src.data_utils import TextMelDataset, TextMelCollate
 class Tacotron2Loss(nn.Module):
     def __init__(self):
         super(Tacotron2Loss, self).__init__()
-        self.mse_loss = nn.MSELoss(reduction='none')  # Use 'none' for manual masking
+        self.mse_loss = nn.MSELoss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss()
+        # Attention guidance scheduling params
+        self.attn_weight_start = 1.0
+        self.min_attn_weight = 0.2
+        self.entropy_target = 2.0  # when entropy drops below this, begin decaying weight
+        self.current_attention_weight = self.attn_weight_start
+
+        self.global_step = 0  # counts forward() calls (batches/iterations)
 
     def get_mask_from_lengths(self, lengths):
         max_len = torch.max(lengths).item()
@@ -24,8 +32,43 @@ class Tacotron2Loss(nn.Module):
         mask = (ids < lengths.unsqueeze(1)).bool()
         return ~mask
 
-    def forward(self, model_outputs, targets):
-        mel_out_postnet, mel_out, gate_out, _ = model_outputs
+    def create_diagonal_attention_target(self, text_lengths, num_steps, alignments):
+        """
+        Per-sample diagonal Gaussian targets with annealed σ.
+        text_lengths: (B,) tensor of true encoder (text) lengths
+        num_steps: decoder time steps (len(alignments))
+        """
+        batch_size = len(alignments[0])
+        max_text_len = int(text_lengths.max().item())
+
+        # σ schedule (same for all samples; could be individualized if desired)
+        init_sigma = torch.clamp(
+            text_lengths.float() * config.attention_initial_sigma_factor,
+            min=3.0, max=config.attention_max_sigma_cap
+        )  # (B,)
+        progress = min(1.0, self.global_step / float(config.attention_sigma_warmup_steps))
+        sigma = init_sigma - (init_sigma - config.attention_min_sigma) * progress  # (B,)
+        self.current_sigma = float(sigma.mean().item())
+
+        device = alignments[0].device
+        diagonal_target = torch.zeros(batch_size, num_steps, max_text_len, device=device)
+        base_positions = torch.arange(max_text_len, device=device, dtype=torch.float)
+
+        for b in range(batch_size):
+            Lb = int(text_lengths[b].item())
+            pos_slice = base_positions[:Lb]
+            sigma_b = sigma[b]
+            for t in range(num_steps):
+                # Scale expected position to sample's true length
+                expected_pos = min(int(t * Lb / num_steps), Lb - 1)
+                gaussian = torch.exp(-0.5 * ((pos_slice - expected_pos) / sigma_b) ** 2)
+                gaussian = gaussian / (gaussian.sum() + 1e-8)
+                diagonal_target[b, t, :Lb] = gaussian
+            # Padded tail remains zero => no target mass outside true length
+        return diagonal_target
+
+    def forward(self, model_outputs, targets, text_lengths=None):
+        mel_out_postnet, mel_out, gate_out, alignments = model_outputs
         mel_target, gate_target, mel_lengths = targets
 
         # FIX: No transpose needed now - outputs are already (batch, time, n_mels)
@@ -52,26 +95,61 @@ class Tacotron2Loss(nn.Module):
         
         loss_mel = mel_loss_1 + mel_loss_2
         loss_gate = self.bce_loss(gate_out, gate_target)
-        
-        total_loss = loss_mel + loss_gate
-        return total_loss, loss_mel, loss_gate
 
-def save_alignment_plot(alignment, path):
-    """Saves a plot of the attention alignment to a file."""
-    # The alignment is a list of tensors from the last batch, 
-    # take the first item for visualization.
-    # Shape of alignment: (num_decoder_steps, num_encoder_steps)
-    alignment = alignment[0].detach().cpu().numpy().T
+        # --- KL-based attention guidance with entropy-weight schedule ---
+        attention_kl = torch.tensor(0.0, device=mel_out.device)
+        attn_entropy = torch.tensor(0.0, device=mel_out.device)
+        if len(alignments) > 1 and text_lengths is not None:
+            try:
+                attn_weights = torch.stack(alignments, dim=1)  # (B, T_dec, T_enc_max)
+                B, T_dec, T_enc_max = attn_weights.shape
+                # Length-aware target
+                diagonal_target = self.create_diagonal_attention_target(
+                    text_lengths, T_dec, alignments
+                )  # (B, T_dec, T_enc_max)
+                attn_weights_safe = attn_weights.clamp_min(1e-8)
+                log_pred = attn_weights_safe.log()
+                attention_kl = F.kl_div(log_pred, diagonal_target, reduction='batchmean')
+                attn_entropy = -(attn_weights_safe * log_pred).sum(dim=2).mean()
+                # Weight schedule
+                if attn_entropy <= self.entropy_target:
+                    ratio = (attn_entropy / self.entropy_target).clamp_min(0.0)
+                    self.current_attention_weight = max(
+                        self.min_attn_weight,
+                        self.attn_weight_start * ratio.item()
+                    )
+                else:
+                    self.current_attention_weight = self.attn_weight_start
+            except Exception as e:
+                print(f"Warning: Attention KL failed: {e}")
+                self.current_attention_weight = self.attn_weight_start
+
+        total_loss = loss_mel + loss_gate + self.current_attention_weight * attention_kl
+        # Return raw KL (unweighted) so caller can log both raw and weighted contribution
+        self.global_step += 1  # increment after each successful forward
+        return total_loss, loss_mel, loss_gate, attention_kl
+
+def save_alignment_plot(alignments, path, sample_index: int = 0):
+    """
+    Saves a plot of the attention alignment to a file.
+
+    alignments: list length T_dec; each element tensor (B, T_enc)
+    Produces matrix (T_dec, T_enc) for a chosen sample (default 0).
+    """
+    # Stack: (T_dec, B, T_enc)
+    attn_stack = torch.stack(alignments, dim=0)
+    if sample_index >= attn_stack.size(1):
+        sample_index = 0
+    matrix = attn_stack[:, sample_index, :].detach().cpu().numpy()  # (T_dec, T_enc)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(alignment, aspect='auto', origin='lower',
+    im = ax.imshow(matrix, aspect='auto', origin='lower',
                    interpolation='none', cmap='viridis')
     fig.colorbar(im, ax=ax)
     plt.xlabel("Encoder timestep (Phonemes)")
     plt.ylabel("Decoder timestep")
-    plt.title("Attention Alignment")
+    plt.title(f"Attention Alignment (sample {sample_index})")
     plt.tight_layout()
-    
     plt.savefig(path)
     plt.close()
 
@@ -117,8 +195,10 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         # Force batch size 8 for debug mode
         debug_loader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=TextMelCollate(), drop_last=True)
         debug_batch = next(iter(debug_loader))
-        text_padded, _, mel_padded, mel_lengths = debug_batch
+        text_padded, input_lengths, mel_padded, mel_lengths = debug_batch  # was '_' before
+        # BUG FIX: move text_padded to device (was omitted -> device mismatch on MPS)
         text_padded = text_padded.to(device)
+        input_lengths = input_lengths.to(device)
         mel_padded = mel_padded.to(device)
         mel_lengths = mel_lengths.to(device)
         # Create gate targets for this batch
@@ -134,7 +214,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         try:
             with torch.no_grad():
                 print("  - Creating model outputs...")
-                model_outputs = model(text_padded, mel_padded)
+                model_outputs = model(text_padded, mel_padded, input_lengths)  # pass lengths
                 print("  - ✅ Forward pass successful!")
                 print(f"  - Output shapes: {[x.shape if hasattr(x, 'shape') else len(x) for x in model_outputs]}")
         except Exception as e:
@@ -144,17 +224,24 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         for iteration in range(epochs * 20):  # Fewer iterations for safety
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                model_outputs = model(text_padded, mel_padded)
-                total_loss, mel_loss, gate_loss = criterion(model_outputs, (mel_padded, gate_target, mel_lengths))
+                model_outputs = model(text_padded, mel_padded, input_lengths)
+                total_loss, mel_loss, gate_loss, attention_kl = criterion(
+                    model_outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths
+                )
+            # Optional KL cap (uncomment if KL overwhelms):
+            # attention_kl = torch.clamp(attention_kl, max=100.0)
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             if (iteration + 1) % 5 == 0:
-                print(f"Iteration {iteration+1:4d}, Loss: {total_loss.item():.6f}")
-                print(f"  📊 Mel Loss: {mel_loss.item():.4f}, Gate Loss: {gate_loss.item():.4f}")
-                
+                eff_attn = criterion.current_attention_weight * attention_kl.item()
+                print(f"Iteration {iteration+1:4d}, Total: {total_loss.item():.6f}")
+                print(f"  Mel: {mel_loss.item():.4f} | Gate: {gate_loss.item():.4f} | "
+                      f"Attn(KL raw): {attention_kl.item():.4f} | w: {criterion.current_attention_weight:.2f} | "
+                      f"w*KL: {eff_attn:.4f} | σ: {getattr(criterion,'current_sigma',float('nan')):.2f}")
+
                 # Add attention diagnostics
                 _, _, _, alignments = model_outputs
                 if len(alignments) > 0:
@@ -199,9 +286,10 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         print(f"\nEpoch: {epoch + 1}/{epochs}")
         
         for i, batch in enumerate(data_loader):
-            text_padded, _, mel_padded, mel_lengths = batch
+            text_padded, input_lengths, mel_padded, mel_lengths = batch  # capture lengths
             
             text_padded = text_padded.to(device)
+            input_lengths = input_lengths.to(device)
             mel_padded = mel_padded.to(device)
             mel_lengths = mel_lengths.to(device)
             
@@ -215,24 +303,27 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
             
             # Autocast is also enabled only on GPU
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                model_outputs = model(text_padded, mel_padded)
-                loss = criterion(model_outputs, (mel_padded, gate_target, mel_lengths))
-            
-            # Backpropagation using the scaler
-            scaler.scale(loss).backward()
+                model_outputs = model(text_padded, mel_padded, input_lengths)
+                total_loss, mel_loss, gate_loss, attention_kl = criterion(
+                    model_outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths
+                )
+            # Optional KL cap (uncomment if needed):
+            # attention_kl = torch.clamp(attention_kl, max=100.0)
+            # BUG FIX: use total_loss (scalar) for scaler / backward
+            scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             
-            epoch_loss += loss.item()
-            
-            # this print statement sometimes does not work
-            # if (i + 1) % 10 == 0:
-            #     print(f"  Batch {i+1}/{len(data_loader)}, Loss: {loss.item():.6f}", end='\r')
-            
-            # use this instead
-            print(f"  Batch {i+1}/{len(data_loader)}, Loss: {loss.item():.6f}")
+            epoch_loss += total_loss.item()
+
+            eff_attn = criterion.current_attention_weight * attention_kl.item()
+            print(f"  Batch {i+1}/{len(data_loader)}, "
+                  f"Total: {total_loss.item():.6f} | Mel: {mel_loss.item():.4f} | "
+                  f"Gate: {gate_loss.item():.4f} | Attn(KL raw): {attention_kl.item():.4f} | "
+                  f"w: {criterion.current_attention_weight:.2f} | w*KL: {eff_attn:.4f} | "
+                  f"σ: {getattr(criterion,'current_sigma',float('nan')):.2f}")
         
         avg_epoch_loss = epoch_loss / len(data_loader)
         epoch_time = time.time() - start_time
@@ -248,8 +339,8 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         print(f"Checkpoint saved to {checkpoint_path}")
         
         # Save the attention alignment from the last batch of the epoch
-        if model_outputs is not None: # type: ignore
-            _, _, _, alignments = model_outputs #type: ignore
+        if model_outputs is not None:
+            _, _, _, alignments = model_outputs
             alignment_path = os.path.join(checkpoint_dir, f"alignment_epoch_{epoch+1}.png")
             save_alignment_plot(alignments, alignment_path)
             print(f"Alignment plot saved to {alignment_path}")

@@ -47,6 +47,12 @@ attention_dim = 128
 location_n_filters = 32
 location_kernel_size = 31
 
+# Attention guidance (Gaussian target) schedule
+attention_initial_sigma_factor = 0.05   # initial σ = max(3, factor * text_len)
+attention_sigma_warmup_steps = 4000     # steps over which σ anneals to 1.0
+attention_min_sigma = 1.0               # final (sharp) σ
+attention_max_sigma_cap = 20.0          # optional safety cap
+
 # Post-Net parameters
 postnet_embedding_dim = 512
 postnet_kernel_size = 5
