@@ -57,3 +57,12 @@ attention_max_sigma_cap = 20.0          # optional safety cap
 postnet_embedding_dim = 512
 postnet_kernel_size = 5
 postnet_n_convolutions = 5
+
+# Training schedule (step-based milestones)
+lr_decay_milestones = [50000, 100000, 150000]  # global steps
+lr_decay_gamma = 0.8                           # multiply LR when milestone reached
+attention_lr_multiplier = 1.5                  # >1 speeds attention sharpening
+postnet_freeze_steps = 3000                    # steps before enabling PostNet
+max_grad_norm = 1.0                            # gradient clipping
+save_every_steps = 5000                        # extra step checkpoint frequency
+accumulation_steps = 1                         # set >1 to simulate larger batch

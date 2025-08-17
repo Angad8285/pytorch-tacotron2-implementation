@@ -8,6 +8,7 @@ import argparse
 import time
 import os
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 from src import config
 from src.model import Tacotron2
@@ -160,6 +161,50 @@ def save_alignment_plot(alignments, path, sample_index: int = 0):
     plt.savefig(path)
     plt.close()
 
+def compute_attention_entropy(alignments):
+    if len(alignments) == 0:
+        return 0.0
+    with torch.no_grad():
+        attn = torch.stack(alignments, dim=0)  # (T_dec,B,T_enc)
+        attn = attn.clamp_min(1e-8)
+        ent = -(attn * attn.log()).sum(-1).mean().item()
+    return ent
+
+def validate(model, criterion, val_loader, device):
+    model.eval()
+    total_mel = 0.0
+    total_gate = 0.0
+    count = 0
+    attn_entropy = 0.0
+    with torch.no_grad():
+        for batch in val_loader:
+            text_padded, input_lengths, mel_padded, mel_lengths = batch
+            text_padded = text_padded.to(device)
+            input_lengths = input_lengths.to(device)
+            mel_padded = mel_padded.to(device)
+            mel_lengths = mel_lengths.to(device)
+            gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
+            for j, l in enumerate(mel_lengths):
+                gate_target[j, l.item()-1:] = 1
+            outputs = model(text_padded, mel_padded, input_lengths, use_postnet=True)
+            _, mel_out, gate_out, alignments = outputs
+            # Reuse loss computation sans KL weighting (text_lengths provided)
+            _, mel_loss, gate_loss, _ = criterion(outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths)
+            total_mel += mel_loss.item()
+            total_gate += gate_loss.item()
+            attn_entropy += compute_attention_entropy(alignments)
+            count += 1
+    model.train()
+    return total_mel / count, total_gate / count, attn_entropy / count
+
+def adjust_lr(optimizer, global_step):
+    for m in config.lr_decay_milestones:
+        if global_step == m:
+            for g in optimizer.param_groups:
+                g['lr'] *= config.lr_decay_gamma
+            print(f"[LR] Decayed learning rate at step {global_step}")
+            break
+
 def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debug_overfit=False):
     """The main training routine."""
     torch.manual_seed(1234)
@@ -189,8 +234,12 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
     criterion = Tacotron2Loss()
     
     # NEW: configurable PostNet freeze steps (fewer for debug)
-    postnet_freeze_steps = 300 if debug_overfit else 3000
-    global_step = 0  # track here for PostNet gating
+    postnet_freeze_steps = None
+    if debug_overfit:
+        postnet_freeze_steps = 300
+    else:
+        postnet_freeze_steps = config.postnet_freeze_steps
+
     # Optimizer with attention LR scaling (debug) or standard
     if debug_overfit:
         attention_params = list(model.decoder.attention.parameters())
@@ -206,8 +255,37 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         # Shorter sigma warmup for debug
         criterion.sigma_warmup_steps = 800
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        attention_params = list(model.decoder.attention.parameters())
+        attention_param_ids = {id(p) for p in attention_params}
+        other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in attention_param_ids]
+        optimizer = torch.optim.Adam(
+            [
+                {"params": other_params, "lr": learning_rate},
+                {"params": attention_params, "lr": learning_rate * config.attention_lr_multiplier},
+            ]
+        )
     
+    # Resume checkpoint (before scaler definition)
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt.get('epoch', 0)
+        global_step = ckpt.get('global_step', 0)
+        best_val_mel = ckpt.get('best_val_mel', float('inf'))
+        print(f"Resumed from {args.resume} (epoch {start_epoch+1}, step {global_step})")
+    else:
+        start_epoch = 0
+        global_step = 0
+        best_val_mel = float('inf')
+
+    # Add log file path
+    log_path = os.path.join(checkpoint_dir, "training_log.txt")
+    def log_line(msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+
     # --- UNIVERSAL MIXED-PRECISION ---
     # GradScaler is enabled only for CUDA, not MPS due to compatibility issues
     use_amp = (device.type == 'cuda')  # Only use AMP on NVIDIA GPUs
@@ -307,8 +385,8 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         return
 
     # === NORMAL TRAINING MODE ===
-
-    for epoch in range(epochs):
+    accum_steps = max(1, args.accum_steps)
+    for epoch in range(start_epoch, epochs):
         start_time = time.time()
         epoch_loss = 0.0
         print(f"\nEpoch: {epoch + 1}/{epochs}")
@@ -318,67 +396,97 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
             
             # NEW: length sort (descending) for better attention gradients
             sort_idx = torch.argsort(input_lengths, descending=True)
-            text_padded = text_padded[sort_idx]
-            input_lengths = input_lengths[sort_idx]
-            mel_padded = mel_padded[sort_idx]
-            mel_lengths = mel_lengths[sort_idx]
+            text_padded = text_padded[sort_idx].to(device)
+            input_lengths = input_lengths[sort_idx].to(device)
+            mel_padded = mel_padded[sort_idx].to(device)
+            mel_lengths = mel_lengths[sort_idx].to(device)
             
-            text_padded = text_padded.to(device)
-            input_lengths = input_lengths.to(device)
-            mel_padded = mel_padded.to(device)
-            mel_lengths = mel_lengths.to(device)
-            
-            # FIX: Gate target should match mel sequence length (time dimension)
-            # mel_padded is (batch, n_mels, time), we want gate for time dimension
             gate_target = torch.zeros(mel_padded.size(0), mel_padded.size(2), device=device)
-            for j, length in enumerate(mel_lengths):
-                gate_target[j, length.item()-1:] = 1
+            for j, l in enumerate(mel_lengths):
+                gate_target[j, l.item()-1:] = 1
 
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Autocast is also enabled only on GPU
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 use_postnet = (global_step >= postnet_freeze_steps)
                 model_outputs = model(text_padded, mel_padded, input_lengths, use_postnet=use_postnet)
                 total_loss, mel_loss, gate_loss, attention_kl = criterion(
                     model_outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths
                 )
+                total_loss = total_loss / accum_steps
+
             scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            epoch_loss += total_loss.item()
+            if (i + 1) % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            epoch_loss += total_loss.item() * accum_steps
 
             eff_attn = criterion.current_attention_weight * attention_kl.item()
-            print(f"  Batch {i+1}/{len(data_loader)}, "
-                  f"Total: {total_loss.item():.6f} | Mel: {mel_loss.item():.4f} | "
-                  f"Gate: {gate_loss.item():.4f} | Attn(KL raw): {attention_kl.item():.4f} | "
-                  f"w: {criterion.current_attention_weight:.2f} | w*KL: {eff_attn:.4f} | "
-                  f"σ: {getattr(criterion,'current_sigma',float('nan')):.2f}")
-        
+            # Logging
+            if (global_step % 200) == 0:
+                msg = (f"Step {global_step} | Ep {epoch+1} B {i+1}/{len(data_loader)} "
+                       f"Total {epoch_loss/ (i+1):.4f} Mel {mel_loss.item():.4f} Gate {gate_loss.item():.4f} "
+                       f"KL {attention_kl.item():.4f} w {criterion.current_attention_weight:.2f} σ {getattr(criterion,'current_sigma',float('nan')):.2f} "
+                       f"LR {optimizer.param_groups[0]['lr']:.6f}")
+                print(msg)
+                log_line(msg)
+            # Save step checkpoint
+            if config.save_every_steps and (global_step % config.save_every_steps == 0) and global_step > 0:
+                step_ckpt = os.path.join(checkpoint_dir, f"step_{global_step}.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": total_loss.item(),
+                    "best_val_mel": best_val_mel
+                }, step_ckpt)
+            # Adjust LR on milestones
+            adjust_lr(optimizer, global_step)
+            global_step += 1
+
         avg_epoch_loss = epoch_loss / len(data_loader)
         epoch_time = time.time() - start_time
-        print(f"\nEpoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.6f}, Time: {epoch_time:.2f}s")
-        
+        print(f"Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.6f}, Time: {epoch_time:.2f}s")
+
+        # Validation
+        if val_loader:
+            val_mel, val_gate, val_attn_ent = validate(model, criterion, val_loader, device)
+            val_msg = (f"Validation | Epoch {epoch+1} Mel {val_mel:.4f} Gate {val_gate:.4f} "
+                       f"AttnEntropy {val_attn_ent:.3f}")
+            print(val_msg)
+            log_line(val_msg)
+            if val_mel < best_val_mel:
+                best_val_mel = val_mel
+                best_path = os.path.join(checkpoint_dir, "best_model.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_mel": val_mel,
+                    "best_val_mel": best_val_mel
+                }, best_path)
+                print(f"Saved best checkpoint: {best_path}")
+
+        # Epoch checkpoint
         checkpoint_path = os.path.join(checkpoint_dir, f"tacotron2_epoch_{epoch+1}.pth")
         torch.save({
             'epoch': epoch,
+            'global_step': global_step,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': avg_epoch_loss,
+            'best_val_mel': best_val_mel
         }, checkpoint_path)
-        print(f"Checkpoint saved to {checkpoint_path}")
-        
-        # Save the attention alignment from the last batch of the epoch
+        # Alignment save (last batch)
         if model_outputs is not None:
             _, _, _, alignments = model_outputs
             alignment_path = os.path.join(checkpoint_dir, f"alignment_epoch_{epoch+1}.png")
             save_alignment_plot(alignments, alignment_path)
-            print(f"Alignment plot saved to {alignment_path}")
-
     print("\nTraining complete.")
+    return  # end normal mode
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -388,6 +496,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training.')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate.')
     parser.add_argument('--debug', action='store_true', help='Debug mode: overfit on single batch.')
+    parser.add_argument('--val_metadata', type=str, default=None, help='Optional validation metadata CSV.')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume.')
+    parser.add_argument('--postnet_freeze_steps', type=int, default=None, help='Override PostNet freeze steps.')
+    parser.add_argument('--accum_steps', type=int, default=1, help='Gradient accumulation steps.')
     
     args = parser.parse_args()
     
