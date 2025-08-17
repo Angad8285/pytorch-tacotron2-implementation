@@ -97,7 +97,9 @@ class LocationSensitiveAttention(nn.Module):
         )
         self.location_dense = nn.Linear(config.location_n_filters, config.attention_dim, bias=False)
         self.v = nn.Linear(config.attention_dim, 1, bias=True)
-        self.mask = None  # (batch, time)
+        self.mask = None
+        # NEW: learnable energy scale (temperature inverse)
+        self.energy_scale = nn.Parameter(torch.tensor(1.2))  # initialized >1 for mild sharpening
 
     def init_states(self, memory, mask=None):
         """
@@ -124,7 +126,8 @@ class LocationSensitiveAttention(nn.Module):
         loc_feats = self.location_conv(loc_feats_in)                        # (B, F, T_enc)
         loc_feats = loc_feats.transpose(1, 2)                               # (B, T_enc, F)
         loc_feats = self.location_dense(loc_feats)                          # (B, T_enc, attn_dim)
-        energies = self.v(torch.tanh(processed_query + self.processed_memory + loc_feats)).squeeze(-1)  # (B, T_enc)
+        energies = self.v(torch.tanh(processed_query + self.processed_memory + loc_feats)).squeeze(-1)
+        energies = energies * self.energy_scale  # NEW: scale energies
         if self.mask is not None:
             energies = energies.masked_fill(self.mask, -1e9)
         return energies
@@ -414,7 +417,7 @@ class Tacotron2(nn.Module):
 
     # In the Tacotron2 class in src/model.py
 
-    def forward(self, text_inputs, mel_targets, text_lengths=None):
+    def forward(self, text_inputs, mel_targets, text_lengths=None, use_postnet=True):
         """
         text_lengths: (B,) tensor of original (unpadded) text lengths
         """
@@ -431,9 +434,12 @@ class Tacotron2(nn.Module):
         mel_outputs_coarse, gate_outputs, alignments = self.decoder(
             encoder_outputs, mel_targets, mask=enc_mask
         )
-        mel_outputs_coarse_t = mel_outputs_coarse.transpose(1, 2)
-        postnet_residual = self.postnet(mel_outputs_coarse_t).transpose(1, 2)
-        mel_outputs_postnet = mel_outputs_coarse + postnet_residual
+        if use_postnet:
+            mel_outputs_coarse_t = mel_outputs_coarse.transpose(1, 2)
+            postnet_residual = self.postnet(mel_outputs_coarse_t).transpose(1, 2)
+            mel_outputs_postnet = mel_outputs_coarse + postnet_residual
+        else:
+            mel_outputs_postnet = mel_outputs_coarse  # NEW: bypass PostNet early
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
 
     def inference(self, text_inputs, text_lengths=None):

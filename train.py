@@ -21,10 +21,13 @@ class Tacotron2Loss(nn.Module):
         # Attention guidance scheduling params
         self.attn_weight_start = 1.0
         self.min_attn_weight = 0.2
-        self.entropy_target = 2.0  # when entropy drops below this, begin decaying weight
+        self.entropy_target = 3.5  # CHANGED: earlier decay trigger
         self.current_attention_weight = self.attn_weight_start
 
         self.global_step = 0  # counts forward() calls (batches/iterations)
+
+        # Allow per-run override of sigma warmup
+        self.sigma_warmup_steps = config.attention_sigma_warmup_steps
 
     def get_mask_from_lengths(self, lengths):
         max_len = torch.max(lengths).item()
@@ -46,7 +49,7 @@ class Tacotron2Loss(nn.Module):
             text_lengths.float() * config.attention_initial_sigma_factor,
             min=3.0, max=config.attention_max_sigma_cap
         )  # (B,)
-        progress = min(1.0, self.global_step / float(config.attention_sigma_warmup_steps))
+        progress = min(1.0, self.global_step / float(self.sigma_warmup_steps))  # CHANGED: use instance value
         sigma = init_sigma - (init_sigma - config.attention_min_sigma) * progress  # (B,)
         self.current_sigma = float(sigma.mean().item())
 
@@ -110,6 +113,10 @@ class Tacotron2Loss(nn.Module):
                 attn_weights_safe = attn_weights.clamp_min(1e-8)
                 log_pred = attn_weights_safe.log()
                 attention_kl = F.kl_div(log_pred, diagonal_target, reduction='batchmean')
+                # NEW: normalize by decoder length to reduce magnitude
+                attention_kl = attention_kl / T_dec
+                # Optional (safety) cap to avoid domination
+                attention_kl = torch.clamp(attention_kl, max=150.0)
                 attn_entropy = -(attn_weights_safe * log_pred).sum(dim=2).mean()
                 # Weight schedule
                 if attn_entropy <= self.entropy_target:
@@ -179,8 +186,27 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
     print(f"Loaded {len(dataset)} training samples.")
 
     model = Tacotron2().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = Tacotron2Loss()
+    
+    # NEW: configurable PostNet freeze steps (fewer for debug)
+    postnet_freeze_steps = 300 if debug_overfit else 3000
+    global_step = 0  # track here for PostNet gating
+    # Optimizer with attention LR scaling (debug) or standard
+    if debug_overfit:
+        attention_params = list(model.decoder.attention.parameters())
+        # BUG FIX: avoid 'p not in attention_params' (ambiguous tensor truth value)
+        attention_param_ids = {id(p) for p in attention_params}
+        other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in attention_param_ids]
+        optimizer = torch.optim.Adam(
+            [
+                {"params": other_params, "lr": learning_rate},
+                {"params": attention_params, "lr": learning_rate * 2.0},  # higher LR for attention
+            ]
+        )
+        # Shorter sigma warmup for debug
+        criterion.sigma_warmup_steps = 800
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
     # --- UNIVERSAL MIXED-PRECISION ---
     # GradScaler is enabled only for CUDA, not MPS due to compatibility issues
@@ -224,7 +250,8 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         for iteration in range(epochs * 20):  # Fewer iterations for safety
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                model_outputs = model(text_padded, mel_padded, input_lengths)
+                use_postnet = (global_step >= postnet_freeze_steps)
+                model_outputs = model(text_padded, mel_padded, input_lengths, use_postnet=use_postnet)
                 total_loss, mel_loss, gate_loss, attention_kl = criterion(
                     model_outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths
                 )
@@ -235,6 +262,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
+            global_step += 1
             if (iteration + 1) % 5 == 0:
                 eff_attn = criterion.current_attention_weight * attention_kl.item()
                 print(f"Iteration {iteration+1:4d}, Total: {total_loss.item():.6f}")
@@ -286,7 +314,14 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         print(f"\nEpoch: {epoch + 1}/{epochs}")
         
         for i, batch in enumerate(data_loader):
-            text_padded, input_lengths, mel_padded, mel_lengths = batch  # capture lengths
+            text_padded, input_lengths, mel_padded, mel_lengths = batch
+            
+            # NEW: length sort (descending) for better attention gradients
+            sort_idx = torch.argsort(input_lengths, descending=True)
+            text_padded = text_padded[sort_idx]
+            input_lengths = input_lengths[sort_idx]
+            mel_padded = mel_padded[sort_idx]
+            mel_lengths = mel_lengths[sort_idx]
             
             text_padded = text_padded.to(device)
             input_lengths = input_lengths.to(device)
@@ -303,13 +338,11 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
             
             # Autocast is also enabled only on GPU
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                model_outputs = model(text_padded, mel_padded, input_lengths)
+                use_postnet = (global_step >= postnet_freeze_steps)
+                model_outputs = model(text_padded, mel_padded, input_lengths, use_postnet=use_postnet)
                 total_loss, mel_loss, gate_loss, attention_kl = criterion(
                     model_outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths
                 )
-            # Optional KL cap (uncomment if needed):
-            # attention_kl = torch.clamp(attention_kl, max=100.0)
-            # BUG FIX: use total_loss (scalar) for scaler / backward
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
