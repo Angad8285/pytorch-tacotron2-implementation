@@ -51,3 +51,37 @@ location_kernel_size = 31
 postnet_embedding_dim = 512
 postnet_kernel_size = 5
 postnet_n_convolutions = 5
+
+
+# --- Model Parameters (Heavily Scaled-Down for Fast Testing) ---
+symbols_embedding_dim = 128
+
+# Encoder parameters
+encoder_n_convolutions = 3
+encoder_embedding_dim = 128
+encoder_kernel_size = 5
+
+# Decoder parameters
+n_mels = 80
+decoder_rnn_dim = 256
+prenet_dim = 64
+max_decoder_steps = 1000
+gate_threshold = 0.5
+p_attention_dropout = 0.1
+p_decoder_dropout = 0.1
+
+# Post-Net parameters
+postnet_embedding_dim = 256
+postnet_kernel_size = 5
+postnet_n_convolutions = 5
+
+# Attention parameters
+attention_rnn_dim = 256  # Must match decoder_rnn_dim
+attention_dim = 64
+location_n_filters = 16
+location_kernel_size = 17  # Must be an odd number
+
+# In src/config.py
+gate_positive_weight = 10
+# --- NEW ---
+guided_attention_alpha = 5.0
