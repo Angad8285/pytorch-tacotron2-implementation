@@ -47,41 +47,22 @@ attention_dim = 128
 location_n_filters = 32
 location_kernel_size = 31
 
+# Attention guidance (Gaussian target) schedule
+attention_initial_sigma_factor = 0.05   # initial σ = max(3, factor * text_len)
+attention_sigma_warmup_steps = 4000     # steps over which σ anneals to 1.0
+attention_min_sigma = 1.0               # final (sharp) σ
+attention_max_sigma_cap = 20.0          # optional safety cap
+
 # Post-Net parameters
 postnet_embedding_dim = 512
 postnet_kernel_size = 5
 postnet_n_convolutions = 5
 
-
-# --- Model Parameters (Heavily Scaled-Down for Fast Testing) ---
-symbols_embedding_dim = 128
-
-# Encoder parameters
-encoder_n_convolutions = 3
-encoder_embedding_dim = 128
-encoder_kernel_size = 5
-
-# Decoder parameters
-n_mels = 80
-decoder_rnn_dim = 256
-prenet_dim = 64
-max_decoder_steps = 1000
-gate_threshold = 0.5
-p_attention_dropout = 0.1
-p_decoder_dropout = 0.1
-
-# Post-Net parameters
-postnet_embedding_dim = 256
-postnet_kernel_size = 5
-postnet_n_convolutions = 5
-
-# Attention parameters
-attention_rnn_dim = 256  # Must match decoder_rnn_dim
-attention_dim = 64
-location_n_filters = 16
-location_kernel_size = 17  # Must be an odd number
-
-# In src/config.py
-gate_positive_weight = 10
-# --- NEW ---
-guided_attention_alpha = 5.0
+# Training schedule (step-based milestones)
+lr_decay_milestones = [50000, 100000, 150000]  # global steps
+lr_decay_gamma = 0.8                           # multiply LR when milestone reached
+attention_lr_multiplier = 1.5                  # >1 speeds attention sharpening
+postnet_freeze_steps = 3000                    # steps before enabling PostNet
+max_grad_norm = 1.0                            # gradient clipping
+save_every_steps = 5000                        # extra step checkpoint frequency
+accumulation_steps = 1                         # set >1 to simulate larger batch

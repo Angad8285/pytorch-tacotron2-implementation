@@ -79,83 +79,73 @@ class Encoder(nn.Module):
 
 class LocationSensitiveAttention(nn.Module):
     """
-    Location-Sensitive Attention mechanism.
-    This implementation is based on the Tacotron 2 paper.
+    Standard Location-Sensitive Attention (Tacotron 2):
+    energies_t = v^T tanh(W_query * query + W_mem * memory + W_loc * F(attn_prev, attn_cum))
+    where F is a 1D conv over concatenated previous and cumulative attention weights.
     """
     def __init__(self):
         super(LocationSensitiveAttention, self).__init__()
         self.query_layer = nn.Linear(config.attention_rnn_dim, config.attention_dim, bias=False)
         self.memory_layer = nn.Linear(config.encoder_embedding_dim, config.attention_dim, bias=False)
-        
-        # --- REFINED ---
-        # The location convolution now takes 1 channel (the cumulative weights)
-        self.location_convolution = nn.Conv1d(
-            in_channels=1,
+        # 2-channel input: previous attention + cumulative attention
+        self.location_conv = nn.Conv1d(
+            in_channels=2,
             out_channels=config.location_n_filters,
             kernel_size=config.location_kernel_size,
-            stride=1,
-            padding=(config.location_kernel_size - 1) // 2,
+            padding=(config.location_kernel_size - 1)//2,
             bias=False
         )
-        self.location_layer = nn.Linear(
-            config.location_n_filters,
-            config.attention_dim,
-            bias=False
-        )
+        self.location_dense = nn.Linear(config.location_n_filters, config.attention_dim, bias=False)
         self.v = nn.Linear(config.attention_dim, 1, bias=True)
-        self.cumulative_weights = None
+        self.mask = None
+        # NEW: learnable energy scale (temperature inverse)
+        self.energy_scale = nn.Parameter(torch.tensor(1.2))  # initialized >1 for mild sharpening
 
-    def _get_alignment_energies(self, query, processed_memory, attention_weights_cat):
-        """Computes the alignment energies."""
-        # FIX: query should be (batch, 1, attention_rnn_dim) 
-        processed_query = self.query_layer(query)  # (batch, 1, attention_dim)
-        
-        # Process the location features from cumulative weights
-        processed_location = self.location_convolution(attention_weights_cat)
-        processed_location = processed_location.transpose(1, 2)  # (batch, time, location_n_filters)
-        processed_location = self.location_layer(processed_location)  # (batch, time, attention_dim)
-        
-        # All should be (batch, time, attention_dim) for broadcasting
-        energies = self.v(torch.tanh(
-            processed_query + processed_location + processed_memory
-        ))  # (batch, time, 1)
-        return energies.squeeze(-1)  # (batch, time)
-
-    def forward(self, query, memory, mask):
+    def init_states(self, memory, mask=None):
         """
-        Runs the forward pass for the attention mechanism.
+        Pre-compute processed memory and reset attention weights.
+        memory: (B, T_enc, D_enc)
+        mask: optional bool tensor (B, T_enc) where True = PAD to be masked out
         """
-        # --- REFINED ---
-        # The core logic is simplified here
-        
-        # Process the cumulative weights to get location features
-        attention_weights_cat = self.cumulative_weights.unsqueeze(1) # type: ignore
-        
-        # Get the alignment scores (energies)
-        alignment = self._get_alignment_energies(
-            query.unsqueeze(1), self.processed_memory, attention_weights_cat
-        )
-        
-        if mask is not None:
-            alignment.data.masked_fill_(mask, -float("inf"))
+        device = memory.device
+        B, T_enc, _ = memory.size()
+        self.processed_memory = self.memory_layer(memory)            # (B, T_enc, attn_dim)
+        self.prev_attn = torch.zeros(B, T_enc, device=device)        # previous step attention
+        self.cum_attn = torch.zeros(B, T_enc, device=device)         # cumulative attention
+        self.mask = mask
 
-        attention_weights = F.softmax(alignment, dim=1)
-        
-        # Update the cumulative weights
-        self.cumulative_weights = self.cumulative_weights + attention_weights # type: ignore
-        
-        context_vector = torch.bmm(attention_weights.unsqueeze(1), memory)
-        context_vector = context_vector.squeeze(1)
-        
-        return context_vector, attention_weights
+    def get_alignment_energies(self, query):
+        """
+        query: (B, attn_rnn_dim)
+        returns: energies (B, T_enc)
+        """
+        # (B, T_enc, attn_dim)
+        processed_query = self.query_layer(query).unsqueeze(1)       # (B, 1, attn_dim)
+        # Location features
+        loc_feats_in = torch.stack([self.prev_attn, self.cum_attn], dim=1)  # (B, 2, T_enc)
+        loc_feats = self.location_conv(loc_feats_in)                        # (B, F, T_enc)
+        loc_feats = loc_feats.transpose(1, 2)                               # (B, T_enc, F)
+        loc_feats = self.location_dense(loc_feats)                          # (B, T_enc, attn_dim)
+        energies = self.v(torch.tanh(processed_query + self.processed_memory + loc_feats)).squeeze(-1)
+        energies = energies * self.energy_scale  # NEW: scale energies
+        if self.mask is not None:
+            energies = energies.masked_fill(self.mask, -1e9)
+        return energies
 
-    def init_states(self, memory):
-        """Initializes the attention states before starting decoding."""
-        batch_size = memory.size(0)
-        max_time = memory.size(1)
-        
-        self.cumulative_weights = torch.zeros(batch_size, max_time, device=memory.device)
-        self.processed_memory = self.memory_layer(memory)
+    def forward(self, query, memory):
+        """
+        query: attention LSTM hidden state (B, attn_rnn_dim)
+        memory: (B, T_enc, D_enc) (unused directly here except for shape integrity)
+        returns: context (B, D_enc), attention_weights (B, T_enc)
+        """
+        energies = self.get_alignment_energies(query)           # (B, T_enc)
+        attn_weights = F.softmax(energies, dim=1)
+        # Update running stats
+        self.prev_attn = attn_weights
+        self.cum_attn = self.cum_attn + attn_weights
+        # Context
+        context = torch.bmm(attn_weights.unsqueeze(1), memory).squeeze(1)  # (B, D_enc)
+        return context, attn_weights
 
 
 # src/model.py
@@ -204,8 +194,9 @@ class Decoder(nn.Module):
             config.prenet_dim + config.encoder_embedding_dim,
             config.decoder_rnn_dim
         )
+        # BUG FIX: must accept (decoder_rnn_dim + encoder_embedding_dim) = 1024 + 512 = 1536
         self.decoder_lstm = nn.LSTMCell(
-            config.decoder_rnn_dim,
+            config.decoder_rnn_dim + config.encoder_embedding_dim,
             config.decoder_rnn_dim
         )
         
@@ -225,16 +216,16 @@ class Decoder(nn.Module):
         seq_len = memory.size(1)
 
         # Initialize the attention mechanism
-        self.attention.init_states(memory)
-        
-        # Initialize the first input frame to zeros
-        self.decoder_input = torch.zeros(batch_size, self.n_mels, device=memory.device)
-        
-        # Initialize LSTM hidden states
-        self.attention_hidden = torch.zeros(batch_size, config.decoder_rnn_dim, device=memory.device)
-        self.attention_cell = torch.zeros(batch_size, config.decoder_rnn_dim, device=memory.device)
-        self.decoder_hidden = torch.zeros(batch_size, config.decoder_rnn_dim, device=memory.device)
-        self.decoder_cell = torch.zeros(batch_size, config.decoder_rnn_dim, device=memory.device)
+        self.attention.init_states(memory, mask)  # pass mask (can be None)
+        # Initialize go frame
+        self.decoder_input = torch.zeros(memory.size(0), self.n_mels, device=memory.device)
+        # Init LSTM states
+        self.attention_hidden = torch.zeros(memory.size(0), config.decoder_rnn_dim, device=memory.device)
+        self.attention_cell = torch.zeros(memory.size(0), config.decoder_rnn_dim, device=memory.device)
+        self.decoder_hidden = torch.zeros(memory.size(0), config.decoder_rnn_dim, device=memory.device)
+        self.decoder_cell = torch.zeros(memory.size(0), config.decoder_rnn_dim, device=memory.device)
+        # Zero initial context
+        self.context = torch.zeros(memory.size(0), config.encoder_embedding_dim, device=memory.device)
 
     def _parse_decoder_outputs(self, mel_outputs, gate_outputs, alignments):
         """Prepares the decoder outputs for returning."""
@@ -247,57 +238,56 @@ class Decoder(nn.Module):
         return mel_outputs, gate_outputs, alignments
 
     def _decode_step(self, memory, mask):
-        """Performs a single decoding step."""
-        # 1. Pass the previous frame through the Pre-Net
-        prenet_output = self.prenet(self.decoder_input)
-        
-        # 2. Get the context vector from the attention mechanism
-        # FIX: Use attention_hidden as query (correct in original Tacotron2)
-        context_vector, self.attention_weights = self.attention.forward(
-            self.attention_hidden, memory, mask
-        )
-
-        # 3. First LSTM: takes prenet output and context vector
-        lstm1_input = torch.cat((prenet_output, context_vector), dim=-1)
+        """
+        One decoding step (teacher-forced or autoregressive).
+        Ordering (Tacotron 2):
+          1) Prenet(previous mel)
+          2) Attention LSTM over [prenet_out, prev_context]
+          3) Compute attention with attention_hidden as query
+          4) Decoder LSTM over [attention_hidden, context]
+          5) Project outputs
+        """
+        prenet_out = self.prenet(self.decoder_input)  # (B, prenet_dim)
+        attn_lstm_in = torch.cat([prenet_out, self.context], dim=-1)
         self.attention_hidden, self.attention_cell = self.attention_lstm(
-            lstm1_input, (self.attention_hidden, self.attention_cell)
+            attn_lstm_in, (self.attention_hidden, self.attention_cell)
         )
-        
-        # 4. Second LSTM: takes output of the first LSTM
+        # Dropout (attention RNN)
+        self.attention_hidden = F.dropout(self.attention_hidden, p=config.p_attention_dropout, training=self.training)
+        # Attention
+        self.context, attn_weights = self.attention(self.attention_hidden, memory)
+        # Decoder LSTM
+        decoder_lstm_in = torch.cat([self.attention_hidden, self.context], dim=-1)
         self.decoder_hidden, self.decoder_cell = self.decoder_lstm(
-            self.attention_hidden, (self.decoder_hidden, self.decoder_cell)
+            decoder_lstm_in, (self.decoder_hidden, self.decoder_cell)
         )
-
-        # 5. Project to get the mel frame and stop token
-        projection_input = torch.cat((self.decoder_hidden, context_vector), dim=-1)
-        
-        mel_output = self.linear_projection(projection_input)
-        gate_output = self.gate_layer(projection_input)
-        
-        return mel_output, gate_output, self.attention_weights
+        self.decoder_hidden = F.dropout(self.decoder_hidden, p=config.p_decoder_dropout, training=self.training)
+        # Projections
+        proj_in = torch.cat([self.decoder_hidden, self.context], dim=-1)
+        mel_output = self.linear_projection(proj_in)
+        gate_output = self.gate_layer(proj_in)
+        return mel_output, gate_output, attn_weights
 
     def forward(self, memory, decoder_inputs, mask):
         """
-        The forward pass for training (uses teacher forcing).
+        Training forward (teacher forcing).
+        mask: (B, T_enc) bool, True = PAD to be masked out in attention
         """
-        # Prepare the ground-truth spectrogram for the decoder
         decoder_inputs = decoder_inputs.transpose(1, 2)
-        decoder_inputs = torch.cat((torch.zeros_like(decoder_inputs[:, :1, :]), decoder_inputs[:, :-1, :]), dim=1)
-
+        decoder_inputs = torch.cat(
+            (torch.zeros_like(decoder_inputs[:, :1, :]), decoder_inputs[:, :-1, :]),
+            dim=1
+        )
         self._initialize_decoder_states(memory, mask)
-
+        # Propagate mask into attention (needed each step only via stored state)
+        self.attention.mask = mask
         mel_outputs, gate_outputs, alignments = [], [], []
-        
-        # Loop through each frame of the ground-truth spectrogram
         for i in range(decoder_inputs.size(1)):
             self.decoder_input = decoder_inputs[:, i, :]
             mel_output, gate_output, attention_weights = self._decode_step(memory, mask)
-            
-            # FIX: Don't squeeze - keep proper dimensions
-            mel_outputs.append(mel_output)  # (batch, n_mels)
-            gate_outputs.append(gate_output)  # (batch, 1)
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
             alignments.append(attention_weights)
-            
         return self._parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
 
     def inference(self, memory):
@@ -425,43 +415,46 @@ class Tacotron2(nn.Module):
         self.postnet = PostNet()
         self.n_mels = config.n_mels
 
+    def _make_mask(self, lengths, max_len):
+        """
+        lengths: (B,) int tensor
+        returns bool mask (B, max_len) True where PAD
+        """
+        ids = torch.arange(0, max_len, device=lengths.device)
+        mask = ids.unsqueeze(0) >= lengths.unsqueeze(1)
+        return mask  # True = pad
+
     # In the Tacotron2 class in src/model.py
 
-    def forward(self, text_inputs, mel_targets):
+    def forward(self, text_inputs, mel_targets, text_lengths=None, use_postnet=True):
         """
-        The main forward pass for training.
+        text_lengths: (B,) tensor of original (unpadded) text lengths
         """
-        encoder_outputs = self.encoder(text_inputs)
-        
+        encoder_outputs = self.encoder(text_inputs)  # (B, T_enc, D)
+        if text_lengths is None:
+            # Fallback assume full length (no padding)
+            text_lengths = torch.full(
+                (text_inputs.size(0),),
+                text_inputs.size(1),
+                dtype=torch.long,
+                device=text_inputs.device
+            )
+        enc_mask = self._make_mask(text_lengths, encoder_outputs.size(1))
         mel_outputs_coarse, gate_outputs, alignments = self.decoder(
-            encoder_outputs, mel_targets, mask=None
+            encoder_outputs, mel_targets, mask=enc_mask
         )
-        
-        # FIX: PostNet expects (batch, n_mels, time), decoder now outputs (batch, time, n_mels)
-        mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
-        postnet_residual = self.postnet(mel_outputs_coarse_transposed)
-        
-        # Convert back to (batch, time, n_mels) to match decoder output format
-        postnet_residual = postnet_residual.transpose(1, 2)
-        
-        mel_outputs_postnet = mel_outputs_coarse + postnet_residual
-        
+        if use_postnet:
+            mel_outputs_coarse_t = mel_outputs_coarse.transpose(1, 2)
+            postnet_residual = self.postnet(mel_outputs_coarse_t).transpose(1, 2)
+            mel_outputs_postnet = mel_outputs_coarse + postnet_residual
+        else:
+            mel_outputs_postnet = mel_outputs_coarse  # NEW: bypass PostNet early
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
 
-    def inference(self, text_inputs):
-        """
-        The forward pass for inference (generating new audio).
-        """
+    def inference(self, text_inputs, text_lengths=None):
         encoder_outputs = self.encoder(text_inputs)
-        
         mel_outputs_coarse, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
-        
-        # FIX: Same PostNet handling as training
-        mel_outputs_coarse_transposed = mel_outputs_coarse.transpose(1, 2)
-        postnet_residual = self.postnet(mel_outputs_coarse_transposed)
-        postnet_residual = postnet_residual.transpose(1, 2)
-        
+        mel_outputs_coarse_t = mel_outputs_coarse.transpose(1, 2)
+        postnet_residual = self.postnet(mel_outputs_coarse_t).transpose(1, 2)
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual
-        
-        # Return in (batch, time, n_mels) format for consistency
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
