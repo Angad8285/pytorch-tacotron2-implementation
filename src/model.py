@@ -161,11 +161,13 @@ class PreNet(nn.Module):
         in_sizes = [in_dim] + sizes[:-1]
         self.layers = nn.ModuleList(
             [nn.Linear(in_size, out_size, bias=False)
-             for (in_size, out_size) in zip(in_sizes, sizes)])
+             for (in_size, out_size) in zip(in_sizes, sizes)]
+        )
 
     def forward(self, x):
+        # FIX: use self.training so dropout is disabled during model.eval()
         for linear in self.layers:
-            x = F.dropout(F.relu(linear(x)), p=0.5, training=True)
+            x = F.dropout(F.relu(linear(x)), p=0.5, training=self.training)
         return x
 
 
@@ -209,6 +211,10 @@ class Decoder(nn.Module):
             config.decoder_rnn_dim + config.encoder_embedding_dim,
             1
         )
+        # Initialize gate bias negative so initial stop prob is low
+        with torch.no_grad():
+            if self.gate_layer.bias is not None:
+                self.gate_layer.bias.fill_(-3.0)  # sigmoid ~0.047
 
     def _initialize_decoder_states(self, memory, mask):
         """Initializes the decoder states for decoding."""
@@ -290,42 +296,40 @@ class Decoder(nn.Module):
             alignments.append(attention_weights)
         return self._parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
 
-    def inference(self, memory):
+    def inference(self, memory, max_len_cap: int | None = None, gate_threshold: float | None = None):
         """
-        The forward pass for inference (autoregressive).
+        Autoregressive inference.
+        max_len_cap: optional hard cap on decoded frames (overrides class max if smaller)
+        gate_threshold: optional temporary override of self.gate_threshold
         """
         self._initialize_decoder_states(memory, mask=None)
+        eff_gate_threshold = gate_threshold if gate_threshold is not None else self.gate_threshold
+        local_max_steps = min(self.max_decoder_steps, max_len_cap) if max_len_cap else self.max_decoder_steps
 
-            # --- ADD THIS BLOCK FOR DEBUGGING ---
+        # First diagnostic step (unchanged)
+        mel_output_debug, gate_output_debug, _ = self._decode_step(memory, mask=None)
+        gate_sig = torch.sigmoid(gate_output_debug)
         print("\n--- DEBUGGING FIRST DECODER STEP ---")
-        mel_output_debug, gate_output_debug, attention_weights_debug = self._decode_step(memory, mask=None)
-        print(f"Initial Stop Token value: {torch.sigmoid(gate_output_debug.data).item():.4f}")
-        print("This value should be LOW (e.g., < 0.5). If it's high, the model stops immediately.")
+        print(f"Initial Stop Token (first sample): {gate_sig[0,0].item():.4f} | mean(batch): {gate_sig.mean().item():.4f}")
+        print("Value should be LOW (<0.5). High value ⇒ immediate stop.")
         print("--- END DEBUGGING ---\n")
-        # --- You can add an `exit()` here to stop the script after debugging ---
-        # exit()
+        self.decoder_input = mel_output_debug.detach()
 
         mel_outputs, gate_outputs, alignments = [], [], []
-
-        # Loop until the model predicts to stop or we hit the max steps
+        steps = 0
         while True:
             mel_output, gate_output, attention_weights = self._decode_step(memory, mask=None)
-            
-            # FIX: Don't squeeze - keep proper dimensions
-            mel_outputs.append(mel_output)  # (batch, n_mels)
-            gate_outputs.append(gate_output)  # (batch, 1)
+            mel_outputs.append(mel_output)
+            gate_outputs.append(gate_output)
             alignments.append(attention_weights)
-            
-            # Check for stop condition
-            if torch.sigmoid(gate_output.data) > self.gate_threshold:
+            steps += 1
+            # Stop if any sample wants to stop AND we produced at least 2 frames
+            if steps > 1 and torch.sigmoid(gate_output).max() > eff_gate_threshold:
                 break
-            elif len(mel_outputs) == self.max_decoder_steps:
-                print("Warning! Reached max decoder steps.")
+            if steps >= local_max_steps:
+                print(f"Warning! Reached decode cap ({local_max_steps}).")
                 break
-            
-            # Use the predicted frame as the input for the next step
             self.decoder_input = mel_output
-            
         return self._parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
 
 
@@ -414,6 +418,27 @@ class Tacotron2(nn.Module):
         self.decoder = Decoder()
         self.postnet = PostNet()
         self.n_mels = config.n_mels
+        # Flag to ensure we only compute & apply projection bias once (lazy init)
+        self._projection_bias_initialized = False
+
+    def _maybe_init_projection_bias(self, mel_targets: torch.Tensor):
+        """Initialize decoder linear_projection bias to per-mel mean from a batch.
+
+        mel_targets shape (B, n_mels, T). Only run once; subsequent calls no-op.
+        Helps early convergence & reduces initial gate spikes.
+        """
+        if self._projection_bias_initialized:
+            return
+        proj = self.decoder.linear_projection
+        if proj.bias is None:
+            self._projection_bias_initialized = True
+            return
+        with torch.no_grad():
+            # Mean over batch and time for each mel channel
+            channel_means = mel_targets.mean(dim=(0, 2))  # (n_mels,)
+            if channel_means.numel() == proj.bias.numel():
+                proj.bias.copy_(channel_means)
+                self._projection_bias_initialized = True
 
     def _make_mask(self, lengths, max_len):
         """
@@ -430,6 +455,9 @@ class Tacotron2(nn.Module):
         """
         text_lengths: (B,) tensor of original (unpadded) text lengths
         """
+        # Lazy bias init using real data statistics (first batch)
+        if not self._projection_bias_initialized:
+            self._maybe_init_projection_bias(mel_targets)
         encoder_outputs = self.encoder(text_inputs)  # (B, T_enc, D)
         if text_lengths is None:
             # Fallback assume full length (no padding)
@@ -451,9 +479,22 @@ class Tacotron2(nn.Module):
             mel_outputs_postnet = mel_outputs_coarse  # NEW: bypass PostNet early
         return (mel_outputs_postnet, mel_outputs_coarse, gate_outputs, alignments)
 
-    def inference(self, text_inputs, text_lengths=None):
+    def inference(self, text_inputs, text_lengths=None, max_len_cap: int | None = None, gate_threshold: float | None = None):
+        """
+        Autoregressive inference wrapper.
+        Adds optional decode length cap and temporary gate threshold override
+        (used only in debug export).
+        """
         encoder_outputs = self.encoder(text_inputs)
-        mel_outputs_coarse, gate_outputs, alignments = self.decoder.inference(encoder_outputs)
+        # Pass new controls to decoder.inference
+        mel_outputs_coarse, gate_outputs, alignments = self.decoder.inference(
+            encoder_outputs,
+            max_len_cap=max_len_cap,
+            gate_threshold=gate_threshold
+        )
+        # Assert at least a minimal number of frames produced
+        if mel_outputs_coarse.size(1) < 3:
+            print(f"[WARN] Very short mel length ({mel_outputs_coarse.size(1)}) - possible premature stop. Gate threshold={self.decoder.gate_threshold}")
         mel_outputs_coarse_t = mel_outputs_coarse.transpose(1, 2)
         postnet_residual = self.postnet(mel_outputs_coarse_t).transpose(1, 2)
         mel_outputs_postnet = mel_outputs_coarse + postnet_residual

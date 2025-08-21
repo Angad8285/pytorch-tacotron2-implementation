@@ -9,123 +9,203 @@ import time
 import os
 import matplotlib.pyplot as plt
 from datetime import datetime
+import csv
+import numpy as np
 
 from src import config
 from src.model import Tacotron2
 from src.data_utils import TextMelDataset, TextMelCollate
+from src.mel_griffinlim import mel_to_audio as fallback_mel_to_audio
+
+try:
+    import soundfile as sf  # for saving wavs
+except ImportError:
+    sf = None
+# Optional audio helper (graceful if missing)
+try:
+    from src import audio
+except ImportError:
+    audio = None
+
+# === ADD: helper functions for debug export (were missing) ===
+def _ids_to_phoneme_string(id_tensor: torch.Tensor, length: int) -> str:
+    """
+    Convert token id sequence (with padding) into a readable phoneme string.
+    """
+    symbols = config.SYMBOLS
+    seq = id_tensor[:length].tolist()
+    return ' '.join(symbols[i] for i in seq)
+
+def _export_debug_inference(model, batch_tensors, device, checkpoint_dir):
+    """
+    Run autoregressive inference on the overfit debug batch and save:
+      - alignment plot
+      - per-sample trimmed mel tensors
+      - per-sample phoneme text file
+      - optional wav (if audio.mel_to_audio & soundfile available)
+      - pairs.csv linking indices to files
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    text_padded = batch_tensors["text"].to(device)
+    input_lengths = batch_tensors["input_lengths"].to(device)
+    mel_lengths = batch_tensors.get("mel_lengths")  # optional
+
+    # Derive cap from training batch if available
+    max_len_cap = None
+    if mel_lengths is not None:
+        max_len_cap = int(mel_lengths.max().item() * 1.10)  # +10% buffer
+
+    model.eval()
+    with torch.no_grad():
+        mel_post, mel_coarse, gate, alignments = model.inference(
+            text_padded,
+            max_len_cap=max_len_cap  # no forced lower gate threshold
+        )
+
+    # Alignment plot (sample 0)
+    align_path = os.path.join(checkpoint_dir, "debug_infer_alignment.png")
+    save_alignment_plot(alignments, align_path, sample_index=0)
+    print(f"🔍 Inference alignment saved: {align_path}")
+
+    rows = []
+    for b in range(mel_post.size(0)):
+        gate_sig = torch.sigmoid(gate[b])
+        stops = (gate_sig > 0.5).nonzero(as_tuple=True)[0]
+        if len(stops) == 0 and max_len_cap is not None:
+            # Fallback: trim to original target length if gate never fired
+            end_idx = int(mel_lengths[b].item())
+        else:
+            end_idx = (stops[0].item() + 1) if len(stops) > 0 else mel_post.size(1)
+        mel_b = mel_post[b, :end_idx]  # (T_trim, n_mels)
+        mel_file = f"debug_infer_mel_{b}.pt"
+        torch.save(mel_b.cpu(), os.path.join(checkpoint_dir, mel_file))
+
+        length_int = int(input_lengths[b].item())
+        phoneme_str = _ids_to_phoneme_string(text_padded[b].cpu(), length_int)
+        txt_file = f"sample_{b}.txt"
+        with open(os.path.join(checkpoint_dir, txt_file), "w", encoding="utf-8") as f:
+            f.write(phoneme_str + "\n")
+
+        # WAV export logic updated:
+        wav_file = ""
+        # Primary path: provided audio.mel_to_audio
+        if audio is not None and hasattr(audio, "mel_to_audio") and sf is not None:
+            try:
+                wav = audio.mel_to_audio(mel_b.transpose(0, 1).cpu())
+                wav_file = f"debug_infer_{b}.wav"
+                sf.write(os.path.join(checkpoint_dir, wav_file), wav.numpy(), config.SAMPLING_RATE)
+            except Exception as e:
+                print(f"⚠️  Primary WAV export failed (sample {b}), trying fallback: {e}")
+        # Fallback path
+        if wav_file == "" and sf is not None:
+            try:
+                wav = fallback_mel_to_audio(mel_b.transpose(0, 1))  # (n_mels,T)
+                wav_file = f"debug_infer_{b}.wav"
+                sf.write(os.path.join(checkpoint_dir, wav_file), wav.numpy(), config.SAMPLING_RATE)
+            except Exception as e:
+                print(f"⚠️  Fallback Griffin-Lim failed (sample {b}): {e}")
+        if sf is None and wav_file == "":
+            print("⚠️  soundfile not installed; skipping wav export.")
+
+        rows.append({
+            "sample_index": b,
+            "text_file": txt_file,
+            "mel_file": mel_file,
+            "wav_file": wav_file
+        })
+
+    pairs_path = os.path.join(checkpoint_dir, "pairs.csv")
+    with open(pairs_path, "w", newline='', encoding="utf-8") as cf:
+        writer = csv.DictWriter(cf, fieldnames=["sample_index", "text_file", "mel_file", "wav_file"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"📝 Paired metadata written: {pairs_path}")
+    model.train()
+# === END ADD ===
 
 class Tacotron2Loss(nn.Module):
     def __init__(self):
         super(Tacotron2Loss, self).__init__()
-        self.mse_loss = nn.MSELoss(reduction='none')
+        # Losses
+        self.l1_loss = nn.L1Loss(reduction='none')
         self.bce_loss = nn.BCEWithLogitsLoss()
+
         # Attention guidance scheduling params
         self.attn_weight_start = 1.0
         self.min_attn_weight = 0.2
-        self.entropy_target = 3.5  # CHANGED: earlier decay trigger
+        self.entropy_target = 3.5  # earlier decay trigger
         self.current_attention_weight = self.attn_weight_start
 
-        self.global_step = 0  # counts forward() calls (batches/iterations)
-
-        # Allow per-run override of sigma warmup
+        # Step counters / schedules
+        self.global_step = 0
         self.sigma_warmup_steps = config.attention_sigma_warmup_steps
 
     def get_mask_from_lengths(self, lengths):
         max_len = torch.max(lengths).item()
         ids = torch.arange(0, max_len, device=lengths.device, dtype=torch.long)
         mask = (ids < lengths.unsqueeze(1)).bool()
-        return ~mask
+        return ~mask  # True where padding
 
     def create_diagonal_attention_target(self, text_lengths, num_steps, alignments):
-        """
-        Per-sample diagonal Gaussian targets with annealed σ.
-        text_lengths: (B,) tensor of true encoder (text) lengths
-        num_steps: decoder time steps (len(alignments))
-        """
         batch_size = len(alignments[0])
         max_text_len = int(text_lengths.max().item())
-
-        # σ schedule (same for all samples; could be individualized if desired)
         init_sigma = torch.clamp(
             text_lengths.float() * config.attention_initial_sigma_factor,
             min=3.0, max=config.attention_max_sigma_cap
-        )  # (B,)
-        progress = min(1.0, self.global_step / float(self.sigma_warmup_steps))  # CHANGED: use instance value
-        sigma = init_sigma - (init_sigma - config.attention_min_sigma) * progress  # (B,)
+        )
+        progress = min(1.0, self.global_step / float(self.sigma_warmup_steps))
+        sigma = init_sigma - (init_sigma - config.attention_min_sigma) * progress
         self.current_sigma = float(sigma.mean().item())
 
         device = alignments[0].device
         diagonal_target = torch.zeros(batch_size, num_steps, max_text_len, device=device)
         base_positions = torch.arange(max_text_len, device=device, dtype=torch.float)
-
         for b in range(batch_size):
             Lb = int(text_lengths[b].item())
             pos_slice = base_positions[:Lb]
             sigma_b = sigma[b]
             for t in range(num_steps):
-                # Scale expected position to sample's true length
                 expected_pos = min(int(t * Lb / num_steps), Lb - 1)
                 gaussian = torch.exp(-0.5 * ((pos_slice - expected_pos) / sigma_b) ** 2)
                 gaussian = gaussian / (gaussian.sum() + 1e-8)
                 diagonal_target[b, t, :Lb] = gaussian
-            # Padded tail remains zero => no target mass outside true length
         return diagonal_target
 
     def forward(self, model_outputs, targets, text_lengths=None):
-        mel_out_postnet, mel_out, gate_out, alignments = model_outputs
-        mel_target, gate_target, mel_lengths = targets
+        mel_out_postnet, mel_out, gate_out, alignments = model_outputs  # mel: (B, T, n_mels)
+        mel_target, gate_target, mel_lengths = targets  # mel_target: (B, n_mels, T)
 
-        # FIX: No transpose needed now - outputs are already (batch, time, n_mels)
-        # mel_out and mel_out_postnet are now (batch, time, n_mels)
-        # mel_target should be (batch, n_mels, time) - transpose it to match
-        mel_target = mel_target.transpose(1, 2)  # (batch, n_mels, time) -> (batch, time, n_mels)
-        
-        mask = self.get_mask_from_lengths(mel_lengths)
-        # Expand mask to cover mel dimensions: (batch, time) -> (batch, time, n_mels)
-        mask = mask.unsqueeze(-1).expand(-1, -1, config.n_mels)
-        
-        # Calculate mel losses with proper masking and normalization
-        mel_loss_1 = self.mse_loss(mel_out, mel_target)
-        mel_loss_2 = self.mse_loss(mel_out_postnet, mel_target)
-        
-        # Apply mask and normalize by valid frames
+        # Align target shape to predictions
+        mel_target = mel_target.transpose(1, 2)  # -> (B, T, n_mels)
+
+        # Padding mask
+        mask = self.get_mask_from_lengths(mel_lengths)  # (B, T)
+        mask = mask.unsqueeze(-1).expand(-1, -1, config.n_mels)  # (B, T, n_mels)
+
+        mel_loss_1 = self.l1_loss(mel_out, mel_target)
+        mel_loss_2 = self.l1_loss(mel_out_postnet, mel_target)
         mel_loss_1.masked_fill_(mask, 0.0)
         mel_loss_2.masked_fill_(mask, 0.0)
-        
-        # Normalize by number of valid frames and mels
-        valid_frames = (~mask).float().sum()
-        mel_loss_1 = mel_loss_1.sum() / valid_frames
-        mel_loss_2 = mel_loss_2.sum() / valid_frames
-        
+        valid = (~mask).float().sum()
+        mel_loss_1 = mel_loss_1.sum() / valid
+        mel_loss_2 = mel_loss_2.sum() / valid
         loss_mel = mel_loss_1 + mel_loss_2
         loss_gate = self.bce_loss(gate_out, gate_target)
 
-        # --- KL-based attention guidance with entropy-weight schedule ---
         attention_kl = torch.tensor(0.0, device=mel_out.device)
-        attn_entropy = torch.tensor(0.0, device=mel_out.device)
         if len(alignments) > 1 and text_lengths is not None:
             try:
                 attn_weights = torch.stack(alignments, dim=1)  # (B, T_dec, T_enc_max)
-                B, T_dec, T_enc_max = attn_weights.shape
-                # Length-aware target
-                diagonal_target = self.create_diagonal_attention_target(
-                    text_lengths, T_dec, alignments
-                )  # (B, T_dec, T_enc_max)
-                attn_weights_safe = attn_weights.clamp_min(1e-8)
-                log_pred = attn_weights_safe.log()
-                attention_kl = F.kl_div(log_pred, diagonal_target, reduction='batchmean')
-                # NEW: normalize by decoder length to reduce magnitude
-                attention_kl = attention_kl / T_dec
-                # Optional (safety) cap to avoid domination
+                B, T_dec, _ = attn_weights.shape
+                diagonal_target = self.create_diagonal_attention_target(text_lengths, T_dec, alignments)
+                attn_safe = attn_weights.clamp_min(1e-8)
+                log_pred = attn_safe.log()
+                attention_kl = F.kl_div(log_pred, diagonal_target, reduction='batchmean') / T_dec
                 attention_kl = torch.clamp(attention_kl, max=150.0)
-                attn_entropy = -(attn_weights_safe * log_pred).sum(dim=2).mean()
-                # Weight schedule
+                attn_entropy = -(attn_safe * log_pred).sum(dim=2).mean()
                 if attn_entropy <= self.entropy_target:
                     ratio = (attn_entropy / self.entropy_target).clamp_min(0.0)
-                    self.current_attention_weight = max(
-                        self.min_attn_weight,
-                        self.attn_weight_start * ratio.item()
-                    )
+                    self.current_attention_weight = max(self.min_attn_weight, self.attn_weight_start * ratio.item())
                 else:
                     self.current_attention_weight = self.attn_weight_start
             except Exception as e:
@@ -133,8 +213,7 @@ class Tacotron2Loss(nn.Module):
                 self.current_attention_weight = self.attn_weight_start
 
         total_loss = loss_mel + loss_gate + self.current_attention_weight * attention_kl
-        # Return raw KL (unweighted) so caller can log both raw and weighted contribution
-        self.global_step += 1  # increment after each successful forward
+        self.global_step += 1
         return total_loss, loss_mel, loss_gate, attention_kl
 
 def save_alignment_plot(alignments, path, sample_index: int = 0):
@@ -205,7 +284,18 @@ def adjust_lr(optimizer, global_step):
             print(f"[LR] Decayed learning rate at step {global_step}")
             break
 
-def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debug_overfit=False):
+def train(
+    metadata_path,
+    checkpoint_dir,
+    epochs,
+    batch_size,
+    learning_rate,
+    debug_overfit=False,
+    val_metadata=None,
+    resume=None,
+    postnet_freeze_steps_override=None,
+    accum_steps=1
+):
     """The main training routine."""
     torch.manual_seed(1234)
     
@@ -226,17 +316,31 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         collate_fn=collate_fn, num_workers=0
     )
     
+    # OPTIONAL validation loader
+    val_loader = None
+    if val_metadata:
+        val_dataset = TextMelDataset(val_metadata)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=TextMelCollate(),
+            num_workers=0
+        )
+        print(f"Loaded {len(val_dataset)} validation samples.")
+
     model = Tacotron2().to(device)
     criterion = Tacotron2Loss()
     
-    # NEW: configurable PostNet freeze steps (fewer for debug)
-    postnet_freeze_steps = None
+    # PostNet freeze steps
     if debug_overfit:
-        postnet_freeze_steps = 300
+        postnet_freeze_steps = 0  # allow PostNet immediately for clearer audio
     else:
-        postnet_freeze_steps = config.postnet_freeze_steps
+        postnet_freeze_steps = (postnet_freeze_steps_override
+                                if postnet_freeze_steps_override is not None
+                                else config.postnet_freeze_steps)
 
-    # Optimizer with attention LR scaling (debug) or standard
+    # Optimizer (attention LR scaling in both modes appropriately)
     if debug_overfit:
         attention_params = list(model.decoder.attention.parameters())
         # BUG FIX: avoid 'p not in attention_params' (ambiguous tensor truth value)
@@ -262,14 +366,14 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         )
     
     # Resume checkpoint (before scaler definition)
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+    if resume:
+        ckpt = torch.load(resume, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('global_step', 0)
         best_val_mel = ckpt.get('best_val_mel', float('inf'))
-        print(f"Resumed from {args.resume} (epoch {start_epoch+1}, step {global_step})")
+        print(f"Resumed from {resume} (epoch {start_epoch+1}, step {global_step})")
     else:
         start_epoch = 0
         global_step = 0
@@ -291,7 +395,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
     
     # === DEBUGGING MODE: OVERFIT ON SINGLE BATCH ===
     if debug_overfit:
-        print("🔥 DEBUG MODE: Training on single batch to test overfitting capability")
+        print("🔥 DEBUG MODE: Training on single batch to test overfitting capability (L1 loss, log-power mels)")
         # Force batch size 8 for debug mode
         debug_loader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=TextMelCollate(), drop_last=True)
         debug_batch = next(iter(debug_loader))
@@ -329,8 +433,6 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
                 total_loss, mel_loss, gate_loss, attention_kl = criterion(
                     model_outputs, (mel_padded, gate_target, mel_lengths), text_lengths=input_lengths
                 )
-            # Optional KL cap (uncomment if KL overwhelms):
-            # attention_kl = torch.clamp(attention_kl, max=100.0)
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -343,50 +445,54 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
                 print(f"  Mel: {mel_loss.item():.4f} | Gate: {gate_loss.item():.4f} | "
                       f"Attn(KL raw): {attention_kl.item():.4f} | w: {criterion.current_attention_weight:.2f} | "
                       f"w*KL: {eff_attn:.4f} | σ: {getattr(criterion,'current_sigma',float('nan')):.2f}")
-
-                # Add attention diagnostics
                 _, _, _, alignments = model_outputs
                 if len(alignments) > 0:
-                    # Get attention from last decoder step
-                    last_attention = alignments[-1][0]  # (encoder_steps,)
-                    print(f"  🎯 Attention - max: {last_attention.max().item():.4f}, "
-                          f"min: {last_attention.min().item():.4f}, "
-                          f"std: {last_attention.std().item():.4f}")
-                    print(f"  📍 Attention peak at encoder position: {last_attention.argmax().item()}")
-                    
-                    # Check attention movement across decoder steps
-                    if len(alignments) > 10:
-                        first_peak = alignments[0][0].argmax().item()
-                        mid_peak = alignments[len(alignments)//2][0].argmax().item() 
-                        last_peak = alignments[-1][0].argmax().item()
-                        print(f"  🔄 Attention movement: {first_peak} → {mid_peak} → {last_peak} (should increase)")
-                        
-                        # Check if attention is stuck
-                        if first_peak == last_peak:
-                            print(f"  ⚠️  WARNING: Attention is stuck at position {first_peak}!")
-                    
-                    # Check attention sharpness
+                    last_attention = alignments[-1][0]
                     entropy = -(last_attention * torch.log(last_attention + 1e-8)).sum().item()
-                    print(f"  📈 Attention entropy: {entropy:.3f} (lower=sharper, target<2.0)")
+                    print(f"  📈 Attention entropy: {entropy:.3f}")
             if (iteration + 1) % 10 == 0:
                 _, _, _, alignments = model_outputs
                 alignment_path = os.path.join(checkpoint_dir, f"debug_alignment_iter_{iteration+1}.png")
                 save_alignment_plot(alignments, alignment_path)
                 print(f"🎯 Alignment saved: {alignment_path}")
-            if total_loss.item() < 0.1:
-                print(f"🎉 SUCCESS! Loss dropped to {total_loss.item():.6f} - Model can learn!")
+            if mel_loss.item() < 1.0:
+                print(f"🎉 SUCCESS! Mel L1 dropped to {mel_loss.item():.4f} (threshold 1.0)")
                 print(f"🎯 Final alignment saved to: debug_alignment_iter_{iteration+1}.png")
                 break
+        try:
+            export_dir = os.path.join(checkpoint_dir, "debug_export")
+            os.makedirs(export_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(export_dir, "overfit_model.pth"))
+            torch.save({
+                "text": text_padded.cpu(),
+                "input_lengths": input_lengths.cpu(),
+                "mel": mel_padded.cpu(),
+                "mel_lengths": mel_lengths.cpu()
+            }, os.path.join(export_dir, "debug_batch.pt"))
+            print(f"💾 Saved overfit model + batch to {export_dir}")
+            _export_debug_inference(
+                model,
+                {
+                    "text": text_padded.cpu(),
+                    "input_lengths": input_lengths.cpu(),
+                    "mel_lengths": mel_lengths.cpu()
+                },
+                device,
+                export_dir
+            )
+        except Exception as e:
+            print(f"⚠️  Debug export failed: {e}")
         print("🔥 DEBUG MODE COMPLETE")
         return
 
     # === NORMAL TRAINING MODE ===
-    accum_steps = max(1, args.accum_steps)
+    accum_steps = max(1, accum_steps)
     for epoch in range(start_epoch, epochs):
         start_time = time.time()
         epoch_loss = 0.0
         print(f"\nEpoch: {epoch + 1}/{epochs}")
         
+        model_outputs = None  # INIT: ensure defined even if no batches
         for i, batch in enumerate(data_loader):
             text_padded, input_lengths, mel_padded, mel_lengths = batch
             
@@ -447,7 +553,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
         print(f"Epoch {epoch+1} complete. Avg Loss: {avg_epoch_loss:.6f}, Time: {epoch_time:.2f}s")
 
         # Validation
-        if val_loader:
+        if val_loader is not None:
             val_mel, val_gate, val_attn_ent = validate(model, criterion, val_loader, device)
             val_msg = (f"Validation | Epoch {epoch+1} Mel {val_mel:.4f} Gate {val_gate:.4f} "
                        f"AttnEntropy {val_attn_ent:.3f}")
@@ -465,9 +571,7 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
                     "best_val_mel": best_val_mel
                 }, best_path)
                 print(f"Saved best checkpoint: {best_path}")
-
-        # Epoch checkpoint
-        checkpoint_path = os.path.join(checkpoint_dir, f"tacotron2_epoch_{epoch+1}.pth")
+        # Epoch checkpoint (include global_step)
         torch.save({
             'epoch': epoch,
             'global_step': global_step,
@@ -475,14 +579,39 @@ def train(metadata_path, checkpoint_dir, epochs, batch_size, learning_rate, debu
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': avg_epoch_loss,
             'best_val_mel': best_val_mel
-        }, checkpoint_path)
+        }, os.path.join(checkpoint_dir, f"tacotron2_epoch_{epoch+1}.pth"))
         # Alignment save (last batch)
         if model_outputs is not None:
             _, _, _, alignments = model_outputs
             alignment_path = os.path.join(checkpoint_dir, f"alignment_epoch_{epoch+1}.png")
             save_alignment_plot(alignments, alignment_path)
     print("\nTraining complete.")
-    return  # end normal mode
+
+def _mel_scale_diagnostics(mel: torch.Tensor, tag: str):
+    """
+    Print statistics to detect if mel looks like (0,1) linear vs log-compressed.
+    mel shape expected (B, n_mels, T)
+    """
+    with torch.no_grad():
+        m = mel.float()
+        stats = {
+            "min": float(m.min().item()),
+            "max": float(m.max().item()),
+            "mean": float(m.mean().item()),
+            "std": float(m.std().item()),
+        }
+        # Sample percentiles (flattened)
+        flat = m.view(-1)
+        pct = torch.quantile(flat, torch.tensor([0.01, 0.05, 0.5, 0.95, 0.99], device=flat.device)).cpu().numpy()
+        # Heuristics
+        linear_like = stats["min"] >= -1e-4 and 0.0 <= stats["max"] <= 1.05
+        narrow_dyn = (stats["max"] - stats["min"]) < 1.2  # log-mels usually span several dB
+        print(f"[MEL DIAG] {tag}: min {stats['min']:.4f} max {stats['max']:.4f} mean {stats['mean']:.4f} std {stats['std']:.4f}")
+        print(f"[MEL DIAG] {tag}: p01 {pct[0]:.4f} p05 {pct[1]:.4f} p50 {pct[2]:.4f} p95 {pct[3]:.4f} p99 {pct[4]:.4f}")
+        if linear_like and narrow_dyn:
+            print(f"[MEL DIAG] {tag}: Looks like 0–1 linear or min-max normalized (NOT log). HiFi-GAN pretrained expects log-mel (negative values).")
+        else:
+            print(f"[MEL DIAG] {tag}: Distribution may already be log-compressed (presence of negatives or wider dynamic range).")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -505,5 +634,9 @@ if __name__ == '__main__':
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
-        debug_overfit=args.debug
+        debug_overfit=args.debug,
+        val_metadata=args.val_metadata,
+        resume=args.resume,
+        postnet_freeze_steps_override=args.postnet_freeze_steps,
+        accum_steps=args.accum_steps
     )

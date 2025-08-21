@@ -2,18 +2,36 @@
 
 import librosa
 import numpy as np
-import torch 
-from . import config  # Use a relative import to get settings from config.py
+import torch
+from . import config  # relative import
+from .mel_griffinlim import mel_to_audio as _griffinlim_mel_to_audio
 
-def get_mel_spectrogram(filepath: str) -> np.ndarray:
+"""Audio feature extraction utilities.
+
+Switched to vocoder-compatible log-mel representation (natural log of mel power).
+This replaces the previous dB -> [0,1] normalization which was incompatible with
+pretrained HiFi-GAN expectations. New pipeline:
+
+1. Load waveform (resampled to config.SAMPLING_RATE).
+2. Compute mel power spectrogram using librosa's validated implementation.
+3. Dynamic range compression: log(clamp(mel_power, min=1e-5)).
+
+Returned tensor shape: (n_mels, T), dtype float32.
+
+NOTE: After this change you MUST regenerate any previously processed mels; mixing
+old [0,1]-normalized dB mels with new log-mels will break training/inference.
+"""
+
+_MEL_EPS = 1e-5
+
+def get_mel_spectrogram(filepath: str) -> torch.Tensor:
+    """Compute vocoder-style log-mel spectrogram.
+
+    Returns:
+        torch.Tensor: (n_mels, T) log-mel (natural log of mel power).
     """
-    Converts an audio file into a log-scale mel spectrogram.
-    """
-    # Load the audio, resampling to our standard rate
-    y, sr = librosa.load(filepath, sr=config.SAMPLING_RATE)
-    
-    # Compute the mel spectrogram
-    mel_spec = librosa.feature.melspectrogram(
+    y, _ = librosa.load(filepath, sr=config.SAMPLING_RATE)
+    mel_power = librosa.feature.melspectrogram(
         y=y,
         sr=config.SAMPLING_RATE,
         n_fft=config.N_FFT,
@@ -21,15 +39,20 @@ def get_mel_spectrogram(filepath: str) -> np.ndarray:
         win_length=config.WIN_LENGTH,
         n_mels=config.N_MELS,
         fmin=config.FMIN,
-        fmax=config.FMAX
-    )
-    
-    # Convert the power spectrogram to decibels with proper dynamic range
-    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-    
-    # Normalize to [0, 1] range for stable training
-    # Typical mel spectrograms range from -80dB to 0dB
-    mel_spec_normalized = (mel_spec_db + 80.0) / 80.0  # Map [-80, 0] to [0, 1]
-    mel_spec_normalized = np.clip(mel_spec_normalized, 0.0, 1.0)  # Ensure bounds
-    
-    return mel_spec_normalized
+        fmax=config.FMAX,
+        power=2.0,               # power spectrogram (|S|**2)
+        center=True
+    )  # (n_mels, T)
+    mel_power = np.clip(mel_power, _MEL_EPS, None)
+    log_mel = np.log(mel_power).astype(np.float32)  # natural log(power)
+    return torch.from_numpy(log_mel)
+
+
+def mel_to_audio(mel: torch.Tensor) -> torch.Tensor:
+    """Convert a (n_mels, T) mel (log-power or linear) to waveform via Griffin-Lim.
+
+    Accepts either log-power or linear mel; downstream helper detects scale.
+    """
+    return _griffinlim_mel_to_audio(mel)
+
+__all__ = ["get_mel_spectrogram", "mel_to_audio"]

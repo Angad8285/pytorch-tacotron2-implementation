@@ -16,6 +16,12 @@ __pycache__/
 # Ignore raw datasets
 data/LibriSpeech/
 data/LJSpeech-1.1/
+data/
+processed/
+debugging_before_merger/
+gt_vocoder_check/
+gt_vocoder_check_run/
+checkpoints/
 
 # Ignore all generated metadata files
 data/*_metadata.csv
